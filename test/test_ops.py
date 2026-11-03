@@ -1644,20 +1644,45 @@ class TestCommon(TestCase):
             if dtype in allowed_backward_dtypes:
                 unsupported_backward_dtypes.add(dtype)
 
+        claimed_forward = set(op.supported_dtypes(device_type))
+        claimed_backward = set(op.supported_backward_dtypes(device_type))
+
+        # Only dtypes that work on all or none of the samples can fail the checks
+        # below, so further samples cannot change the result once a claimed dtype
+        # has worked or an unclaimed dtype has failed.
+        def is_settled(dtype):
+            fwd = supported_dtypes if dtype in claimed_forward else unsupported_dtypes
+            if dtype not in allowed_backward_dtypes:
+                return dtype in fwd
+            bwd = (
+                supported_backward_dtypes
+                if dtype in claimed_backward
+                else unsupported_backward_dtypes
+            )
+            return dtype in fwd and dtype in bwd
+
         for dtype in all_types_and_complex_and(
             *((torch.half, torch.bfloat16, torch.bool) + include_complex32)
         ):
             # tries to acquire samples - failure indicates lack of support
             requires_grad = dtype in allowed_backward_dtypes
             try:
-                samples = tuple(
+                samples = iter(
                     op.sample_inputs(device, dtype, requires_grad=requires_grad)
                 )
             except Exception as e:
                 unsupported(dtype, e)
                 continue
 
-            for sample in samples:
+            while not is_settled(dtype):
+                try:
+                    sample = next(samples)
+                except StopIteration:
+                    break
+                except Exception as e:
+                    unsupported(dtype, e)
+                    break
+
                 # tries to call operator with the sample - failure indicates
                 #   lack of support
                 try:
@@ -1730,13 +1755,9 @@ class TestCommon(TestCase):
         )
         unsupported_backward = unsupported_backward_dtypes - supported_backward_dtypes
 
-        device_type = torch.device(device).type
-
-        claimed_forward = set(op.supported_dtypes(device_type))
         supported_but_unclaimed_forward = supported_forward - claimed_forward
         claimed_but_unsupported_forward = claimed_forward & unsupported_forward
 
-        claimed_backward = set(op.supported_backward_dtypes(device_type))
         supported_but_unclaimed_backward = supported_backward - claimed_backward
         claimed_but_unsupported_backward = claimed_backward & unsupported_backward
 
