@@ -1994,6 +1994,370 @@ class TestGridExprMaximum(TestCase):
         self.assertEqual(grid.maximum([10, 20, 5]), 20)
 
 
+class TestPrecomputedGridConfigMatching(TestCase):
+    # Candidates whose grids depend on num_warps (a user grid lambda can
+    # read num_warps from the config meta), so each candidate is
+    # distinguishable by both index and grid.
+    _GRIDS = {4: "8", 8: "4"}
+
+    def _candidates(self, warps_order=(4, 8)):
+        return [
+            {
+                "config": {
+                    "BLOCK": 128,
+                    "num_warps": num_warps,
+                    "num_stages": 2,
+                },
+                "python": [self._GRIDS[num_warps], "1", "1"],
+                "cpp": [f"{self._GRIDS[num_warps]}L", "1L", "1L"],
+                "python_slow": [self._GRIDS[num_warps], "1", "1"],
+            }
+            for num_warps in warps_order
+        ]
+
+    def _make_grid(self, warps_order=(4, 8)):
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        return PrecomputedGrid(
+            inductor_meta={"precomputed_grids": self._candidates(warps_order)},
+            mode="python",
+        )
+
+    def test_exact_match_selects_warps_dependent_grid(self):
+        # An exact config (num_warps included) must select its own
+        # candidate even though another candidate shares the BLOCK size.
+        for num_warps, expected in self._GRIDS.items():
+            grid = self._make_grid()
+            grid.generate({"BLOCK": 128, "num_warps": num_warps, "num_stages": 2})
+            self.assertEqual(
+                (grid.x_grid, grid.y_grid, grid.z_grid), (expected, "1", "1")
+            )
+
+    def test_matches_pipelining_disabled_retry_config(self):
+        # compile_by_disabling_pipelining retries with num_stages=1 when
+        # the chosen config exceeds shared memory; the retry must still
+        # select the candidate for the chosen num_warps.
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        candidates = self._candidates()
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+            ),
+            1,
+        )
+        grid = self._make_grid()
+        grid.generate({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+        self.assertEqual((grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1"))
+
+    def test_candidate_order_does_not_change_result(self):
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        for warps_order in [(4, 8), (8, 4)]:
+            candidates = self._candidates(warps_order)
+            idx = PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+            )
+            self.assertEqual(candidates[idx]["config"]["num_warps"], 8)
+            grid = self._make_grid(warps_order)
+            grid.generate({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+            self.assertEqual((grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1"))
+
+    def test_exact_match_distinguishes_num_stages(self):
+        # Candidates differing only in num_stages (listed with the
+        # num_stages=3 candidate first): an exact num_stages=2 lookup
+        # must not be relaxed onto the first candidate.
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        candidates = [
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 3},
+                "python": ["6", "1", "1"],
+                "cpp": ["6L", "1L", "1L"],
+                "python_slow": ["6", "1", "1"],
+            },
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 2},
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            },
+        ]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 2}
+            ),
+            1,
+        )
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 3}
+            ),
+            0,
+        )
+
+    def test_num_stages_kwarg_is_not_relaxed(self):
+        # NUM_STAGES is a user kernel kwarg a grid can read, so it must
+        # match exactly: a retried lookup (lowered to 1) finds no
+        # candidate instead of reusing a grid computed for NUM_STAGES=3.
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        candidates = [
+            {
+                "config": {
+                    "BLOCK": 128,
+                    "NUM_STAGES": 3,
+                    "num_warps": 8,
+                    "num_stages": 3,
+                },
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            }
+        ]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "NUM_STAGES": 3, "num_warps": 8, "num_stages": 3},
+            ),
+            0,
+        )
+        self.assertIsNone(
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+            )
+        )
+        # The stage keys do not relax independently either: the relaxed
+        # tier is gated on the lookup num_stages being 1.
+        self.assertIsNone(
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "NUM_STAGES": 1, "num_warps": 8, "num_stages": 3},
+            )
+        )
+
+    def test_from_meta_with_retried_config(self):
+        # The entry point make_launcher() uses: candidates stored from
+        # the pre-retry config (num_stages=3), looked up with the retried
+        # config (num_stages lowered to 1 by
+        # compile_by_disabling_pipelining).
+        from torch._inductor.runtime.triton_heuristics import GridExpr
+
+        inductor_meta = {
+            "grid_type": "PrecomputedGrid",
+            "precomputed_grids": [
+                {
+                    "config": {
+                        "BLOCK": 128,
+                        "num_warps": 8,
+                        "num_stages": 3,
+                    },
+                    "python": ["4", "1", "1"],
+                    "cpp": ["4L", "1L", "1L"],
+                    "python_slow": ["4", "1", "1"],
+                }
+            ],
+        }
+        grid = GridExpr.from_meta(
+            inductor_meta,
+            {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+        )
+        self.assertEqual((grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1"))
+
+    def test_exact_tier_wins_over_relaxed_tier(self):
+        # A num_stages=1 lookup with an exactly matching candidate must
+        # select it, not relax onto the earlier num_stages=3 candidate.
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        candidates = [
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 3},
+                "python": ["6", "1", "1"],
+                "cpp": ["6L", "1L", "1L"],
+                "python_slow": ["6", "1", "1"],
+            },
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            },
+        ]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+            ),
+            1,
+        )
+
+    def test_relaxed_tier_raises_on_ambiguous_grids(self):
+        # Candidates differing only in stage counts with different grids:
+        # the retried (stage=1) lookup cannot tell which one it came
+        # from, so it must raise rather than pick the first.
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        def cand(stages, grid):
+            return {
+                "config": {
+                    "BLOCK": 128,
+                    "num_warps": 8,
+                    "num_stages": stages,
+                },
+                "python": [grid, "1", "1"],
+                "cpp": [f"{grid}L", "1L", "1L"],
+                "python_slow": [grid, "1", "1"],
+            }
+
+        candidates = [cand(2, "4"), cand(4, "8")]
+        with self.assertRaises(AssertionError):
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+            )
+
+    def test_relaxed_tier_accepts_identical_grids(self):
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        def cand(stages):
+            return {
+                "config": {
+                    "BLOCK": 128,
+                    "num_warps": 8,
+                    "num_stages": stages,
+                },
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            }
+
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                [cand(2), cand(4)],
+                {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+            ),
+            0,
+        )
+
+    def test_make_launchers_retries_with_precomputed_grid(self):
+        # Drive the real chain: _make_launchers ->
+        # compile_by_disabling_pipelining -> make_launcher ->
+        # GridExpr.from_meta (with a real triton.Config, so the
+        # config_to_dict conversion in from_meta runs).
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from torch._inductor.runtime.triton_compat import OutOfResources, triton
+        from torch._inductor.runtime.triton_heuristics import (
+            CachingAutotuner,
+            config_to_dict,
+            GridExpr,
+        )
+
+        chosen = triton.Config({"BLOCK": 128}, num_warps=8, num_stages=3)
+        other = triton.Config({"BLOCK": 128}, num_warps=4, num_stages=3)
+
+        def cand(cfg, grid):
+            return {
+                "config": config_to_dict(cfg),
+                "python": [grid, "1", "1"],
+                "cpp": [f"{grid}L", "1L", "1L"],
+                "python_slow": [grid, "1", "1"],
+            }
+
+        inductor_meta = {
+            "grid_type": "PrecomputedGrid",
+            "precomputed_grids": [cand(other, "9"), cand(chosen, "4")],
+        }
+
+        class FakeResult:
+            def __init__(self, cfg):
+                self.config = cfg
+
+            def make_launcher(self):
+                if self.config.num_stages > 1:
+                    raise OutOfResources(999, 1, "shared memory")
+                grid = GridExpr.from_meta(inductor_meta, self.config)
+                return (grid.x_grid, grid.y_grid, grid.z_grid)
+
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.configs = [chosen]
+        autotuner.compile_results = [FakeResult(chosen)]
+        autotuner.launchers = []
+        autotuner.inductor_meta = inductor_meta
+        autotuner.device_props = SimpleNamespace(type="cuda", index=0)
+        autotuner._ensure_kernel_loaded = mock.Mock()
+        autotuner.get_device_interface = mock.Mock()
+        autotuner._precompile_config = mock.Mock(
+            side_effect=lambda cfg: FakeResult(cfg)
+        )
+        with mock.patch(
+            "torch._dynamo.device_interface.DeviceGuard", return_value=nullcontext()
+        ):
+            autotuner._make_launchers()
+        self.assertEqual(autotuner.launchers, [("4", "1", "1")])
+        retried = autotuner._precompile_config.call_args.args[0]
+        self.assertEqual(retried.num_stages, 1)
+
+    def test_still_rejects_different_block_sizes(self):
+        from torch._inductor.runtime.triton_heuristics import PrecomputedGrid
+
+        self.assertIsNone(
+            PrecomputedGrid.find_candidate_index(
+                self._candidates(), {"BLOCK": 64, "num_warps": 8, "num_stages": 2}
+            )
+        )
+        grid = self._make_grid()
+        with self.assertRaises(AssertionError):
+            grid.generate({"BLOCK": 64, "num_warps": 8, "num_stages": 2})
+
+    def _aoti_params(self, config):
+        from torch._inductor.codecache import get_cpp_wrapper_cubin_path_name
+
+        return {
+            get_cpp_wrapper_cubin_path_name(): "/tmp/fake_kernel.cubin",
+            "mangled_name": "fake_kernel_mangled",
+            "num_warps": 8,
+            "shared_mem": 1024,
+            "config": config,
+            "inductor_meta": {
+                "grid_type": "PrecomputedGrid",
+                "precomputed_grids": self._candidates(),
+            },
+        }
+
+    def test_aoti_config_header_matches_pipelining_disabled_config(self):
+        # The AOTI lazy path must select the num_warps=8 candidate (index
+        # 1) for a num_stages=1 retry config instead of CONFIG_INDEX=-1.
+        from unittest.mock import patch
+
+        from torch._inductor.codecache import CudaKernelParamCache
+        from torch._inductor.codegen.cpp_wrapper_gpu import (
+            generate_aoti_kernel_config_header,
+        )
+
+        params = self._aoti_params({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+        with patch.object(CudaKernelParamCache, "get", return_value=params):
+            header = generate_aoti_kernel_config_header(["fake_kernel"])
+        self.assertIn("#define FAKE_KERNEL_CONFIG_INDEX 1", header)
+
+    def test_aoti_config_header_rejects_unmatched_config(self):
+        from unittest.mock import patch
+
+        from torch._inductor.codecache import CudaKernelParamCache
+        from torch._inductor.codegen.cpp_wrapper_gpu import (
+            generate_aoti_kernel_config_header,
+        )
+
+        params = self._aoti_params({"BLOCK": 64, "num_warps": 8, "num_stages": 2})
+        with (
+            patch.object(CudaKernelParamCache, "get", return_value=params),
+            self.assertRaises(RuntimeError),
+        ):
+            generate_aoti_kernel_config_header(["fake_kernel"])
+
+
 class TestGrid2DWithYZOverflowZeroYnumel(TestCase):
     """Regression test for https://github.com/pytorch/pytorch/issues/178530"""
 

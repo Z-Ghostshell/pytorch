@@ -190,12 +190,19 @@ def generate_aoti_kernel_config_header(kernel_names: list[str]) -> str:
         config_index: int | None = None
         grid_type = inductor_meta.get("grid_type")
         if grid_type == "PrecomputedGrid":
-            precomputed_grids = inductor_meta.get("precomputed_grids", [])
-            for idx, entry in enumerate(precomputed_grids):
-                entry_config = entry.get("config", {})
-                if all(config_dict.get(k) == v for k, v in entry_config.items()):
-                    config_index = idx
-                    break
+            from ..runtime.triton_heuristics import PrecomputedGrid
+
+            # Matching is tiered (see PrecomputedGrid.find_candidate_index);
+            # raise at compile time rather than deferring to the generated
+            # switch, which throws at launch on an unknown config_index.
+            config_index = PrecomputedGrid.find_candidate_index(
+                inductor_meta.get("precomputed_grids", []), config_dict
+            )
+            if config_index is None:
+                raise RuntimeError(
+                    f"No precomputed grid matches config {config_dict} "
+                    f"for kernel {kernel_name}"
+                )
 
         # Per-subkernel block sizes for combo kernels, or single-element lists.
         num_kernels = combo_grid_meta.get("num_kernels", 1) if combo_grid_meta else 1
@@ -680,7 +687,15 @@ class DeferredTritonCallWrapper:
                 switch_cases.append(
                     f"case {idx}: grid_0 = {g0}; grid_1 = {g1}; grid_2 = {g2}; break;"
                 )
-            switch_cases.append("default: grid_0 = 1; grid_1 = 1; grid_2 = 1; break;")
+            # Unknown config_index is unreachable: both Python producers
+            # (generate_aoti_kernel_config_header and
+            # run_triton_kernel_with_autotune) raise when no candidate
+            # matches. Throw rather than silently launch a wrong grid or
+            # skip the launch and leave outputs unwritten.
+            switch_cases.append(
+                f'default: throw std::runtime_error("Invalid config_index '
+                f'for kernel {kernel_name}");'
+            )
             switch_body = "\n                        ".join(switch_cases)
 
             prefix.splice(

@@ -1191,6 +1191,8 @@ class CachingAutotuner(KernelInterface):
     def compile_by_disabling_pipelining(self, config):
         self._ensure_kernel_loaded()
         cfg = copy.deepcopy(config)
+        # PrecomputedGrid.find_candidate_index relies on this lowering
+        # num_stages to exactly 1.
         cfg.num_stages = 1
         if "NUM_STAGES" in cfg.kwargs:
             cfg.kwargs["NUM_STAGES"] = 1
@@ -5826,14 +5828,82 @@ class FixedGrid(GridExpr):
 
 
 class PrecomputedGrid(GridExpr):
+    @staticmethod
+    def find_candidate_index(
+        precomputed_grids: list[dict[str, Any]], config: dict[str, Any]
+    ) -> int | None:
+        """Return the index of the candidate matching `config`, or None.
+
+        Matching is tiered, most specific first. The exact tier matters
+        because a user grid can depend on `num_warps`/`num_stages` (they
+        are passed to grid lambdas as config kwargs), so candidates that
+        differ only in those values may carry different grids. The
+        relaxed tier handles the pipelining-disabled retry: it accepts a
+        different `num_stages` only when the lookup value is 1, which is
+        exactly what `compile_by_disabling_pipelining` produces.
+        `num_warps` is never relaxed: every lookup config comes from
+        `config_to_dict`, which always reports it, and the retry does
+        not change it. The `NUM_STAGES` kwarg is never relaxed either:
+        unlike `num_stages` it is a user kernel kwarg that a grid can
+        read, so a kernel whose configs carry it fails loudly on the
+        retry (as before this change) rather than reusing a grid
+        computed for a different `NUM_STAGES`.
+
+        The relaxed tier cannot tell which candidate the retried config
+        came from, so it collects every relaxed match: if they carry
+        different grids it raises instead of silently picking the first
+        (a stored grid is reused as-is and is not recomputed for the
+        retried config). Identical grids are unambiguous and return the
+        first match.
+        """
+        for relax_stages in (False, True):
+            matches = []
+            for idx, candidate in enumerate(precomputed_grids):
+                if all(
+                    config.get(k) == v
+                    or (
+                        relax_stages
+                        and k == "num_stages"
+                        and config.get("num_stages") == 1
+                    )
+                    for k, v in candidate["config"].items()
+                ):
+                    if not relax_stages:
+                        return idx
+                    matches.append(idx)
+            if matches:
+                first = precomputed_grids[matches[0]]
+                first_grid = (
+                    first.get("python"),
+                    first.get("cpp"),
+                    first.get("python_slow"),
+                )
+                for idx in matches[1:]:
+                    candidate = precomputed_grids[idx]
+                    grid = (
+                        candidate.get("python"),
+                        candidate.get("cpp"),
+                        candidate.get("python_slow"),
+                    )
+                    if grid != first_grid:
+                        raise AssertionError(
+                            f"Ambiguous precomputed grid for retry config "
+                            f"{config}: candidates {matches} carry different "
+                            f"grids, so the retried config cannot be rebound "
+                            f"to a single candidate in {precomputed_grids}"
+                        )
+                return matches[0]
+        return None
+
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        for candidate in self.inductor_meta["precomputed_grids"]:
-            if all(meta.get(k) == v for k, v in candidate["config"].items()):
-                self.x_grid, self.y_grid, self.z_grid = candidate[self.mode]
-                return
-        raise AssertionError(
-            f"Precomputed grid not found for {meta} in {self.inductor_meta['precomputed_grids']}"
-        )
+        precomputed_grids = self.inductor_meta["precomputed_grids"]
+        candidate_index = self.find_candidate_index(precomputed_grids, meta)
+        if candidate_index is None:
+            raise AssertionError(
+                f"Precomputed grid not found for {meta} in {precomputed_grids}"
+            )
+        candidate = precomputed_grids[candidate_index]
+        self.x_grid, self.y_grid, self.z_grid = candidate[self.mode]
 
 
 class ComboKernelGrid(GridExpr):
