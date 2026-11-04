@@ -2,8 +2,8 @@
 # PartialColumns stage-two kernel and the ordered (inner-tree) column kernel.
 # TileReduce threads own vectorized kept-axis outputs without lane merging. Splitting the
 # reduced axis provides parallelism; unsplit (65536, 256) took 7830us versus ATen's 15.8us.
-# Ordered column lanes each serve one output, and a block's warps split its rows as the row
-# inner tree's warps do, loading rows strided by C; warp 0 merges their roots.
+# Ordered column lanes each serve one output, and a block's workers replay the row inner
+# tree's warps, loading rows strided by C; worker 0 merges their roots.
 
 from collections.abc import Sequence
 from typing import Any, NamedTuple
@@ -14,7 +14,7 @@ from cutlass import const_expr, Int32, Int64
 
 import torch
 
-from ...cutedsl import launch as _L
+from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import cute2torch, torch2cute
 from ...cutedsl.plan_cache import cached_plan
 from ...utils.device import check_current
@@ -56,11 +56,73 @@ _C_THREAD_STAGE2 = 8192
 # while argmax gains 6-8% and wide-short sum gains 15%.
 _THREADS_PER_BLOCK = 32
 _WIDE_ACC_THREADS_PER_BLOCK = 64  # 3-field traits (Welford): see above
+# By default every planned warp (at most 16) gets its own worker; policies that pick
+# fewer workers have each stride over several original warp trees.
+_ORDERED_WORKER_WARPS = 16
 # Multi-field lane replays partially unroll their 32-lane loop by this factor. On B200,
 # fp32 argmax (2, 32769, 33) and bf16 var_mean (2, 32768, 33) columns compiled in
 # 0.8-1.2s instead of the static replay's 7.8-8.6s and ran at 0.92-1.06x of it.
 # Single-field replays stay static: rolled, fp32 sums ran at as little as 0.46x.
 _ORDERED_LANE_UNROLL = 4
+
+
+class OrderedColConfig(NamedTuple):
+    # Useful 32-column blocks (partials * columns / WARP), whatever tile_columns is.
+    min_blocks: int
+    worker_warps: int = _ORDERED_WORKER_WARPS
+    tile_columns: int = WARP
+    full_tiles: bool = False
+
+
+_ORDERED_COL_CONFIGS: dict[tuple[int, int], dict[str, OrderedColConfig]] = {}
+
+
+def select_ordered_col_config(
+    cc: tuple[int, int],
+    dtype: torch.dtype,
+    trait_key: str,
+    columns: int,
+    batches: int,
+    partials: int,
+    *,
+    field_bits: tuple[int, ...],
+    out_dtypes: tuple[torch.dtype, ...],
+) -> OrderedColConfig | None:
+    cfg = _ORDERED_COL_CONFIGS.get(cc, {}).get(trait_key)
+    if (
+        cfg is None
+        or dtype not in (torch.float32, torch.bfloat16)
+        or batches != 1
+        or columns < WARP
+        or partials < 1
+    ):
+        return None
+    fields = (
+        3 if trait_key in ("var0", "varmean0") else 2 if trait_key == "argmaxi32" else 1
+    )
+    output = (
+        dtype
+        if trait_key == "amax" or fields == 3
+        else torch.int64
+        if fields == 2
+        else torch.float32
+    )
+    nouts = 2 if trait_key == "varmean0" else 1
+    if field_bits != (32,) * fields or out_dtypes != (output,) * nouts:
+        return None
+    if partials * columns < WARP * cfg.min_blocks:
+        return None
+    return cfg
+
+
+def _full_column_tiles(plan: Any, rows: int) -> bool:
+    if not plan.batches:
+        return False
+    limit = plan.split[1] if plan.shape == "split" else rows
+    return all(
+        off + (plan.wpr - 1) * chunk + loads * WARP * plan.vec <= limit
+        for off, _, loads, chunk in plan.batches
+    )
 
 
 class ColConfig(NamedTuple):
@@ -220,6 +282,12 @@ class _OrderedColReduce:
         R: int,
         C: int,
         nouts: int,
+        *,
+        worker_warps: int = _ORDERED_WORKER_WARPS,
+        tile_columns: int = WARP,
+        full_tiles: bool = False,
+        partition_begin: int = 0,
+        partition_count: int | None = None,
     ) -> None:
         if plan.shape not in ("looped", "split"):
             raise ValueError(f"ordered columns do not support {plan.shape=}")
@@ -227,6 +295,10 @@ class _OrderedColReduce:
             raise ValueError("ordered columns replay tree vector folds only")
         if len(plan.batches) != 1:
             raise ValueError("ordered columns fold a single planner batch")
+        if worker_warps not in (1, 2, 4, 8, 16):
+            raise ValueError("worker_warps must be one of 1, 2, 4, 8, 16")
+        if tile_columns not in (8, 16, WARP):
+            raise ValueError("tile_columns must be one of 8, 16, 32")
         self.trait = trait
         self.plan = plan
         self.R = R
@@ -235,11 +307,41 @@ class _OrderedColReduce:
         # keeps addresses independent: against per-C kernels, B200 sum, argmax and
         # var_mean (fp32/bf16) ran at 1.04x geomean (0.79-1.70x) for looped R 128-8192
         # and 1.18x (0.69-1.68x) for split R 32768-131072, and a new C skips a 0.8 s
-        # (median) compile. Row views take a 64-bit stride once R * C needs one.
+        # (median) compile. Full tiles read rows in order, where per-C kernels fold the
+        # offsets into loads: there runtime C ran at 0.93x looped and 0.97x split
+        # (best tile mode each; short looped argmax 0.68-0.79x). Row views take a
+        # 64-bit stride once R * C needs one.
         self.wide = R * C >= _INT32_LIMIT
         self.nouts = nouts
-        # Split plans launch one block row per partition.
-        self.partitions = plan.split[0] if plan.shape == "split" else 1
+        self.partition_begin = partition_begin
+        self.partition_count = (
+            plan.split[0] - partition_begin
+            if partition_count is None and plan.shape == "split"
+            else 1
+            if partition_count is None
+            else partition_count
+        )
+        if (
+            self.partition_begin < 0
+            or self.partition_count < 1
+            or (
+                plan.shape == "split"
+                and self.partition_begin + self.partition_count > plan.split[0]
+            )
+        ):
+            raise ValueError("ordered-column partition range is out of bounds")
+        if plan.shape != "split" and (partition_begin, self.partition_count) != (0, 1):
+            raise ValueError("only split plans have ordered-column partitions")
+        # Each worker traverses an original warp tree, even with fewer column lanes.
+        self.workers = min(worker_warps, plan.wpr)
+        self.tile_columns = tile_columns
+        # A ragged final split partition still needs address clamps.
+        ragged_tail = (
+            plan.shape == "split"
+            and plan.split[1] != plan.split[2]
+            and self.partition_begin + self.partition_count == plan.split[0]
+        )
+        self.full_tiles = full_tiles and _full_column_tiles(plan, R) and not ragged_tail
         # Exact looped plans tile the row without padded warps or leaves past R. Skipping
         # their leaf masks, and the shared-memory merge for one-warp rows, ran B200 argmax
         # at up to 1.4x and var_mean at up to 2.4x on exact views; sums were within noise.
@@ -247,7 +349,18 @@ class _OrderedColReduce:
 
     @property
     def cache_sig(self) -> tuple[Any, ...]:
-        return (self.R, self.wide, self.trait.nfields, self.nouts, self.plan.sig)
+        key = (
+            self.R,
+            self.wide,
+            self.trait.nfields,
+            self.nouts,
+            self.workers,
+            self.tile_columns,
+            self.full_tiles,
+            self.partition_begin,
+            self.partition_count,
+        )
+        return key + (self.plan.sig,)
 
     @cute.jit
     def __call__(
@@ -260,8 +373,8 @@ class _OrderedColReduce:
         stream,
     ):
         self.kernel(mIn, mOuts, in_base, num_o, C).launch(
-            grid=[cute.ceil_div(num_o, WARP), self.partitions, 1],
-            block=[WARP, self.plan.wpr, 1],
+            grid=[cute.ceil_div(num_o, self.tile_columns), self.partition_count, 1],
+            block=[self.tile_columns, self.workers, 1],
             stream=stream,
         )
 
@@ -269,8 +382,11 @@ class _OrderedColReduce:
     def _leaf(self, rows, warp_base, k, active, bound, last):
         trait = self.trait
         red = warp_base + k
-        if const_expr(self.exact):
+        if const_expr(self.full_tiles):
             # Every leaf is in bounds, and inactive lanes never store their outputs.
+            return trait.leaf(rows[k], red)
+        if const_expr(self.exact):
+            # As above, but the clamp keeps each address independent of the last one.
             return trait.leaf(rows[cutlass.min(Int32(k), last)], red)
         valid = active & (red < bound)
         # Leaves past the bound read its last in-bounds row; the select below discards
@@ -287,27 +403,11 @@ class _OrderedColReduce:
         ]
         return tile._reduce_vec(vals, self.plan.vec, self.trait.combine)
 
-    @cute.kernel
-    def kernel(
-        self, mIn: cute.Tensor, mOuts: list, in_base: Int64, num_o: Int32, C: Int32
-    ):
-        tx, ty, _ = cute.arch.thread_idx()
-        bx, by, _ = cute.arch.block_idx()
+    @cute.jit
+    def _warp_root(self, mIn, col_base, C, split_base, partition, active, warp):
+        """Replay one original warp's tree over its share of the rows."""
         trait, plan = self.trait, self.plan
-        op, ident = trait.combine, trait.init()
-        split_base = Int32(0)
-        partition = Int32(by)
-        if const_expr(plan.shape == "split"):
-            split_base = partition * Int32(plan.split[1])
-
-        # Each warp of threads replays one original warp's tree.
-        lane, warp = Int32(tx), Int32(ty)
-        output = Int32(bx) * Int32(WARP) + lane
-        active = output < num_o
-        safe = output if active else Int32(0)
-        batch, col = safe // C, safe % C
-        col_base = in_base + Int64(batch) * Int64(self.R) * Int64(C) + Int64(col)
-        nf = const_expr(trait.nfields)
+        op, nf = trait.combine, const_expr(trait.nfields)
         loads, warp_chunk = plan.batches[0][2:]
         warp_base = split_base + warp * Int32(warp_chunk)
         bound = Int32(self.R)
@@ -373,32 +473,69 @@ class _OrderedColReduce:
                     op,
                 )
             tile._streaming_push(load_tree, load_root, load, plan.depth, op)
+        return load_tree[0]
+
+    @cute.kernel
+    def kernel(
+        self, mIn: cute.Tensor, mOuts: list, in_base: Int64, num_o: Int32, C: Int32
+    ):
+        tx, ty, _ = cute.arch.thread_idx()
+        bx, by, _ = cute.arch.block_idx()
+        trait, plan = self.trait, self.plan
+        op, ident = trait.combine, trait.init()
+        split_base = Int32(0)
+        partition = Int32(by) + Int32(const_expr(self.partition_begin))
+        if const_expr(plan.shape == "split"):
+            split_base = partition * Int32(plan.split[1])
+
+        lane, worker = Int32(tx), Int32(ty)
+        columns = const_expr(self.tile_columns)
+        output = Int32(bx) * Int32(columns) + lane
+        active = output < num_o
+        safe = output if active else Int32(0)
+        batch, col = safe // C, safe % C
+        col_base = in_base + Int64(batch) * Int64(self.R) * Int64(C) + Int64(col)
+        nf = const_expr(trait.nfields)
         # Split plans always run 16 warps per row.
         if const_expr(plan.wpr == 1 and plan.shape == "looped"):
             # One warp replays the whole row, so its root needs no shared-memory merge.
-            final = op(ident, load_tree[0])
+            root = self._warp_root(
+                mIn, col_base, C, split_base, partition, active, Int32(0)
+            )
+            final = op(ident, root)
         else:
             smem = cutlass.utils.SmemAllocator()
             roots = [
                 smem.allocate_tensor(
                     trait.fdtypes[f],
-                    cute.make_layout(const_expr(plan.wpr * WARP)),
+                    cute.make_layout(const_expr(plan.wpr * columns)),
                     byte_alignment=8,
                 )
                 for f in range(nf)
             ]
-            slot = warp * Int32(WARP) + lane
-            for f in cutlass.range_constexpr(nf):
-                roots[f][slot] = load_tree[0][f]
+            if const_expr(self.workers == plan.wpr):
+                # One original warp per worker needs no loop.
+                root = self._warp_root(
+                    mIn, col_base, C, split_base, partition, active, worker
+                )
+                for f in cutlass.range_constexpr(nf):
+                    roots[f][worker * Int32(columns) + lane] = root[f]
+            else:
+                for warp in cutlass.range(worker, plan.wpr, self.workers):
+                    warp_root = self._warp_root(
+                        mIn, col_base, C, split_base, partition, active, warp
+                    )
+                    for f in cutlass.range_constexpr(nf):
+                        roots[f][warp * Int32(columns) + lane] = warp_root[f]
             cute.arch.barrier()
             groups = const_expr(plan.wpr // plan.kchunk)
             final = ident
-            if warp == Int32(0):
+            if worker == Int32(0):
                 group_vals = [
                     tile._inner_tree_reduce(
                         [
                             tuple(
-                                roots[f][(g * plan.kchunk + i) * Int32(WARP) + lane]
+                                roots[f][(g * plan.kchunk + i) * Int32(columns) + lane]
                                 for f in range(nf)
                             )
                             for i in range(plan.kchunk)
@@ -408,7 +545,7 @@ class _OrderedColReduce:
                     for g in range(groups)
                 ]
                 # Like TileReduce._fold_itree, only several groups merge across 32 lanes.
-                root = group_vals[0]
+                merged = group_vals[0]
                 if const_expr(groups > 1):
                     padding = ident
                     # Constant identities fold Welford's 0 / 0 count ratio at trace time.
@@ -419,12 +556,12 @@ class _OrderedColReduce:
                             for f in range(nf)
                         )
                     group_vals.extend([padding] * (WARP - groups))
-                    root = tile._inner_tree_reduce(group_vals, op)
+                    merged = tile._inner_tree_reduce(group_vals, op)
                 if const_expr(plan.shape == "split"):
-                    final = root
+                    final = merged
                 else:
                     # The indexed tree seeds its fold with the identity, so -0 sums become +0.
-                    final = op(ident, root)
+                    final = op(ident, merged)
 
         if const_expr(plan.shape == "split"):
             if (Int32(ty) == Int32(0)) & active:
@@ -448,9 +585,16 @@ def reduce_ordered_col(
     out_dtypes: Sequence[torch.dtype],
     nouts: int,
     *,
-    allow_split: bool = False,
+    allow_split: bool | None = None,
+    full_tiles: bool | None = None,
 ) -> tuple[torch.Tensor, ...] | None:
-    """Reduce axis -2 of a contiguous (R, C) or (B, R, C) view, or return None."""
+    """Reduce axis -2 of a contiguous (R, C) or (B, R, C) view, or return None.
+
+    allow_split=None lets the column policy pick the mapping and whether to run split
+    plans; True runs split plans with default mappings and False declines them. Either
+    bool bypasses the policy. An explicit full_tiles overrides the policy's, but with
+    allow_split=None, split plans the policy does not select still decline.
+    """
     if x.dim() == 2 and x.is_contiguous():
         B, (R, C) = 1, x.shape
         out_shape = (C,)
@@ -483,13 +627,71 @@ def reduce_ordered_col(
     # and partitions ride grid y (at most 65535).
     floating = (torch.float32, torch.bfloat16, torch.float16, torch.float64)
     if split and (
-        not allow_split
+        allow_split is False
         or x.dtype not in floating
         or B * C * plan.split[0] >= _INT32_LIMIT
         or plan.split[0] > 65535
     ):
         return None
-    op = _OrderedColReduce(trait, plan, R, C, trait.nfields if split else nouts)
+    cfg = None
+    if allow_split is None:
+        cfg = select_ordered_col_config(
+            _hw.caps(x.device).cc,
+            x.dtype,
+            trait_key,
+            C,
+            B,
+            plan.split[0] if split else 1,
+            field_bits=tuple(dt.width for dt in trait.fdtypes),
+            out_dtypes=tuple(out_dtypes[:nouts]),
+        )
+        if cfg is None and split:
+            return None
+    workers, columns = _ORDERED_WORKER_WARPS, WARP
+    if cfg is not None:
+        workers, columns = cfg.worker_warps, cfg.tile_columns
+        if full_tiles is None:
+            full_tiles = cfg.full_tiles
+    # Only full tiles split off the ragged final partition, which keeps its clamps.
+    ragged = split and plan.split[1] != plan.split[2]
+    if ragged and full_tiles and _full_column_tiles(plan, R):
+        ops = (
+            _OrderedColReduce(
+                trait,
+                plan,
+                R,
+                C,
+                trait.nfields,
+                full_tiles=True,
+                partition_count=plan.split[0] - 1,
+                worker_warps=workers,
+                tile_columns=columns,
+            ),
+            _OrderedColReduce(
+                trait,
+                plan,
+                R,
+                C,
+                trait.nfields,
+                partition_begin=plan.split[0] - 1,
+                partition_count=1,
+                worker_warps=workers,
+                tile_columns=columns,
+            ),
+        )
+    else:
+        ops = (
+            _OrderedColReduce(
+                trait,
+                plan,
+                R,
+                C,
+                trait.nfields if split else nouts,
+                full_tiles=False if full_tiles is None else full_tiles,
+                worker_warps=workers,
+                tile_columns=columns,
+            ),
+        )
     device = x.get_device()
     check_current(device)
     outs = [
@@ -514,17 +716,18 @@ def reduce_ordered_col(
         return fake_in, fake_outs
 
     args = (Int64(x.storage_offset()), Int32(B * C), Int32(C), _stream(device))
-    key = (
-        "ordered_col1" if split else "ordered_col",
-        trait_key,
-        x.dtype,
-        tuple(out.dtype for out in kernel_outs),
-        device,
-    ) + op.cache_sig
-    build = lambda: _compile(op, *_fake(), *args)  # noqa: E731
-    cached_plan(_CACHE, key, build, op=f"aten::{trait_key}")(
-        _L.read_only(kernel_x), kernel_outs, *args
-    )
+    for op in ops:
+        key = (
+            "ordered_col1" if split else "ordered_col",
+            trait_key,
+            x.dtype,
+            tuple(out.dtype for out in kernel_outs),
+            device,
+        ) + op.cache_sig
+        build = lambda: _compile(op, *_fake(), *args)  # noqa: E731
+        cached_plan(_CACHE, key, build, op=f"aten::{trait_key}")(
+            _L.read_only(kernel_x), kernel_outs, *args
+        )
     if split:
         flat_outs = [out.reshape(-1) for out in outs]
         _combine_itree_partials(

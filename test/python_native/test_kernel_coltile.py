@@ -615,6 +615,51 @@ class TestOrderedColRoute(TestCase):
         self.assertEqual((narrow.wide, wide.wide), (False, True))
 
 
+class TestOrderedColHost(TestCase):
+    @parametrize(
+        "updates",
+        [
+            {"worker_warps": 3},
+            {"tile_columns": 7},
+        ],
+    )
+    def test_mapping_guards(self, updates):
+        """Reject worker counts and tile widths the column mapping cannot use."""
+        from torch._native.ops.reductions import kernel_rowtile as rt
+
+        trait = T.SumOps(acc=cutlass.Float32)
+        plan = rt.trait_itree_plan(trait, 32768, 132, 4, stage=False)
+        kwargs = dict(R=32768, C=132, nouts=1)
+        kwargs.update(updates)
+        with self.assertRaises(ValueError):
+            ct._OrderedColReduce(trait, plan, **kwargs)
+
+    def test_policy_contract(self):
+        """Apply a policy only to the trait, dtypes, and occupancy it was measured for."""
+        cfg = ct.OrderedColConfig(4, worker_warps=8, tile_columns=16, full_tiles=True)
+        table = {(9, 0): {"sum": cfg, "argmaxi32": cfg}}
+
+        def select(key="sum", dtype=torch.float32, columns=64, batches=1, **kwargs):
+            contract = {"field_bits": (32,), "out_dtypes": (torch.float32,)} | kwargs
+            partials = contract.pop("partials", 2)
+            return ct.select_ordered_col_config(
+                (9, 0), dtype, key, columns, batches, partials, **contract
+            )
+
+        index = {"field_bits": (32, 32), "out_dtypes": (torch.int64,)}
+        with mock.patch.dict(ct._ORDERED_COL_CONFIGS, table):
+            self.assertEqual(select(), cfg)
+            self.assertEqual(select("argmaxi32", **index), cfg)
+            self.assertIsNone(select("amax"))
+            self.assertIsNone(select(dtype=torch.float64))
+            self.assertIsNone(select(batches=2))
+            self.assertIsNone(select(columns=16))
+            self.assertIsNone(select(out_dtypes=(torch.bfloat16,)))
+            self.assertIsNone(select("argmaxi32", **dict(index, field_bits=(32, 64))))
+            # min_blocks counts 32-column blocks of useful lanes: 3 * 32 < 4 * 32.
+            self.assertIsNone(select(columns=32, partials=3))
+
+
 @unittest.skipUnless(TEST_CUDA and SM90OrLater, "requires Hopper or later")
 class TestOrderedColDevice(TestCase):
     def test_plans_key_and_require_the_current_device(self):
@@ -693,11 +738,52 @@ class TestOrderedColDevice(TestCase):
         ran = {k[0] for k in ct._CACHE if k[1] == key}
         self.assertEqual(ran, {"ordered_col1" if split else "ordered_col"})
 
-    def test_split_plans_can_be_declined(self, device):
+    @parametrize("case", ["unsplit", "empty", "past_end", "negative"])
+    def test_partition_ranges_are_validated(self, device, case):
+        from torch._native.ops.reductions import kernel_rowtile as rt
+
+        trait = T.SumOps(acc=cutlass.Float32)
+        rows = 128 if case == "unsplit" else 32768
+        dev = torch.device(device)
+        plan = rt.trait_itree_plan(trait, rows, 32, 4, stage=False, device=dev)
+        self.assertEqual(plan.shape == "split", case != "unsplit")
+        n = plan.split[0] if plan.shape == "split" else 1
+        begin, count = {
+            "unsplit": (0, 2),
+            "empty": (n, None),
+            "past_end": (n - 1, 2),
+            "negative": (-1, None),
+        }[case]
+        error = "only split plans" if case == "unsplit" else "out of bounds"
+        kwargs = {"partition_begin": begin, "partition_count": count}
+        with self.assertRaisesRegex(ValueError, error):
+            ct._OrderedColReduce(trait, plan, rows, 32, 1, **kwargs)
+
+    def test_full_tiles_exclude_a_ragged_final_partition(self, device):
+        from torch._native.ops.reductions import kernel_rowtile as rt
+
+        trait = T.SumOps(acc=cutlass.Float32)
+        dev = torch.device(device)
+        plan = rt.trait_itree_plan(trait, 32769, 33, 4, stage=False, device=dev)
+        self.assertNotEqual(plan.split[1], plan.split[2])
+        whole = ct._OrderedColReduce(trait, plan, 32769, 33, 1, full_tiles=True)
+        self.assertFalse(whole.full_tiles)
+        count = plan.split[0] - 1
+        head = ct._OrderedColReduce(
+            trait, plan, 32769, 33, 1, full_tiles=True, partition_count=count
+        )
+        self.assertTrue(head.full_tiles)
+
+    @parametrize("allow_split", [False, None])
+    def test_split_plans_can_be_declined(self, device, allow_split):
+        """Decline split plans when disallowed or when the policy does not select them."""
         x = torch.randn(32768, 32, device=device)
         trait = T.SumOps(acc=cutlass.Float32)
         out = [torch.float32]
-        got = ct.reduce_ordered_col(trait, "decline", x, out, 1, allow_split=False)
+        with mock.patch.object(ct, "select_ordered_col_config", return_value=None):
+            got = ct.reduce_ordered_col(
+                trait, "decline", x, out, 1, allow_split=allow_split
+            )
         self.assertIsNone(got)
         # The same view runs as a split plan once allowed.
         got = ct.reduce_ordered_col(trait, "decline", x, out, 1, allow_split=True)
@@ -746,7 +832,10 @@ class TestOrderedColDevice(TestCase):
         trait = T.SumOps(acc=cutlass.Float32)
         for batches, columns in ((2, 33), (3, 33), (2, 64), (1, 1000)):
             x = torch.randn(batches, 128, columns, device=device)
-            got = ct.reduce_ordered_col(trait, "ordered_reuse", x, [torch.float32], 1)
+            # A fixed mapping: the column policy may pick per-C mappings.
+            got = ct.reduce_ordered_col(
+                trait, "ordered_reuse", x, [torch.float32], 1, allow_split=False
+            )
             self.assertEqual(got[0], x.sum(dim=1), atol=1e-4, rtol=1e-4)
         keys = [k for k in ct._CACHE if k[:2] == ("ordered_col", "ordered_reuse")]
         self.assertEqual(len(keys), 1)
@@ -940,7 +1029,91 @@ class TestOrderedColDevice(TestCase):
         with mock.patch.object(ct, "_INT32_LIMIT", 2 * 64 + 32):
             self.assertIsNone(ct.reduce_ordered_col(trait, "decline_int32", x, f32, 1))
 
+    @parametrize(
+        "op,in_dtype,rows,columns,workers,width,offset,split",
+        [
+            ("sum", torch.float32, 128, 132, 8, 16, 4, False),
+            ("argmax", torch.float32, 32769, 33, 8, 8, 4, True),
+            ("var_mean", torch.bfloat16, 32768, 33, 16, 32, 4, True),
+            ("mean", torch.bfloat16, 32769, 36, 16, 8, 1, True),
+            ("amax", torch.bfloat16, 32768, 66, 16, 16, 2, True),
+            ("var_mean", torch.bfloat16, 32768, 34, 16, 16, 2, True),
+            ("sum", torch.float32, 8192, 33, 4, 16, 4, False),
+            ("argmax", torch.float32, 4096, 33, 2, 8, 4, False),
+            ("sum", torch.float32, 129, 33, 8, 16, 4, False),
+        ],
+    )
+    def test_ordered_mapping_bits(
+        self, device, op, in_dtype, rows, columns, workers, width, offset, split
+    ):
+        """Keep worker, tile-width, and multi-output column mappings bitwise exact."""
+        from torch import _native as native
 
+        batches = 2
+        storage = torch.empty(
+            batches * rows * columns + offset, dtype=in_dtype, device=device
+        )
+        x = storage[offset:].view(batches, rows, columns)
+        x.uniform_(-0.5, 0.5)
+        trait = {
+            "sum": T.SumOps(),
+            "mean": T.MeanOps(),
+            "argmax": T.ArgMaxOps(),
+            "var_mean": T.VarMeanOps(correction=0),
+            "amax": T.AMaxOps(),
+        }[op]
+        output = torch.int64 if op == "argmax" else torch.float32
+        outputs = [output] * (2 if op == "var_mean" else 1)
+        cfg = ct.OrderedColConfig(
+            0, worker_warps=workers, tile_columns=width, full_tiles=True
+        )
+        key = f"mapping_{op}_{rows}x{columns}_w{workers}_t{width}"
+        with (
+            native._unconditional_masked(),
+            torch.backends.python_native.cutedsl.disabled(),
+            mock.patch.object(ct, "select_ordered_col_config", return_value=cfg),
+        ):
+            actual = ct.reduce_ordered_col(trait, key, x, outputs, len(outputs))
+            self.assertIsNotNone(actual)
+            # Both paths fold split partials through the shared genitree2 combine.
+            combines = {k[0][1] for k in kg._PLAN if k[0][1:3] == ("genitree2", key)}
+            self.assertEqual(bool(combines), split)
+            # Ordered keys append (R, wide, nfields, nouts, workers, tile_columns,
+            # full_tiles, ...) to five fields.
+            ops = [k for k in ct._CACHE if k[1] == key]
+            n, itemsize = batches * columns, x.element_size()
+            plan = ct.trait_itree_plan(
+                trait, rows, n, itemsize, stage=False, device=device
+            )
+            # Rows with fewer warps than requested use one worker per warp.
+            self.assertEqual({k[9:11] for k in ops}, {(min(workers, plan.wpr), width)})
+            if split:
+                # Full split partitions drop clamps; a ragged final partition keeps them.
+                full = {True, False} if plan.split[1] != plan.split[2] else {True}
+                self.assertEqual({k[11] for k in ops}, full)
+            else:
+                # Every looped case covers whole tiles except the ragged 129 rows.
+                self.assertEqual({k[11] for k in ops}, {rows != 129})
+            reference = kg._try_indexed_itree(
+                trait,
+                key,
+                x,
+                [(rows, columns)],
+                [(columns, 1), (batches, rows * columns)],
+                batches * columns,
+                rows,
+                outputs,
+                len(outputs),
+            )
+            self.assertIsNotNone(reference)
+            self.assertEqual(len(actual), len(reference))
+            for got, expected in zip(actual, reference):
+                self.assertEqual(
+                    got.flatten().view(torch.uint8), expected.view(torch.uint8)
+                )
+
+
+instantiate_parametrized_tests(TestOrderedColHost)
 instantiate_device_type_tests(TestOrderedColDevice, globals(), only_for="cuda")
 instantiate_parametrized_tests(TestOrderedColRoute)
 
