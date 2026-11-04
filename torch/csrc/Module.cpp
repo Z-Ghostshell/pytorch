@@ -2903,6 +2903,33 @@ Call this whenever a new thread is created in order to propagate values from
       py::arg("name"),
       py::arg("epoch"));
 
+  py_module.def(
+      "_set_fake_item_memo",
+      [](const at::Tensor& fake,
+         const py::object& memo,
+         std::optional<uint64_t> epoch) {
+        fake.unsafeGetTensorImpl()->set_fake_item_memo(
+            std::make_shared<c10::SafePyObject>(
+                memo.inc_ref().ptr(), getPyInterpreter()),
+            epoch);
+      },
+      py::arg("fake"),
+      py::arg("memo"),
+      py::arg("epoch"));
+
+  py_module.def(
+      "_get_fake_item_memo",
+      [](const at::Tensor& fake, uint64_t epoch) -> py::object {
+        auto memo = fake.unsafeGetTensorImpl()->fake_item_memo(epoch);
+        if (!memo) {
+          return py::none();
+        }
+        return py::reinterpret_borrow<py::object>(
+            memo->ptr(getPyInterpreter()));
+      },
+      py::arg("fake"),
+      py::arg("epoch"));
+
   py_module.def("_get_fake_constant", [](const at::Tensor& t) -> py::object {
     TORCH_CHECK(t.defined(), "Expected a defined tensor");
     TORCH_CHECK(t.is_fake(), "Expected a fake tensor");
