@@ -633,28 +633,35 @@ class TestOrderedColDevice(TestCase):
         self.assertEqual({k[4] for k in keys}, {x.get_device()})
 
     @parametrize(
-        "op,in_dtype,shape",
+        "op,in_dtype,shape,split",
         [
-            ("sum", torch.float32, (2, 128, 33)),
-            ("sum", torch.float32, (8000, 32)),
-            ("sum", torch.float16, (2, 3000, 32)),
-            ("sum", torch.bfloat16, (2, 3000, 32)),
-            ("mean", torch.float32, (2, 3000, 32)),
-            ("argmax", torch.float32, (4, 2048, 64)),
-            ("var_mean", torch.bfloat16, (2, 2048, 40)),
-            ("argmax", torch.float32, (8000, 32)),
-            ("var_mean", torch.float32, (2, 8000, 32)),
+            ("sum", torch.float32, (2, 128, 33), False),
+            ("sum", torch.float32, (8000, 32), False),
+            ("sum", torch.float16, (2, 3000, 32), False),
+            ("sum", torch.bfloat16, (2, 3000, 32), False),
+            ("mean", torch.float32, (2, 3000, 32), False),
+            ("argmax", torch.float32, (4, 2048, 64), False),
+            ("var_mean", torch.bfloat16, (2, 2048, 40), False),
+            ("argmax", torch.float32, (8000, 32), False),
+            ("var_mean", torch.float32, (2, 8000, 32), False),
             # Exact multi-group merges and a single masked warp.
-            ("sum", torch.float32, (2, 4096, 32)),
-            ("argmax", torch.float32, (2, 8192, 32)),
-            ("sum", torch.float32, (2, 200, 32)),
+            ("sum", torch.float32, (2, 4096, 32), False),
+            ("argmax", torch.float32, (2, 8192, 32), False),
+            ("sum", torch.float32, (2, 200, 32), False),
+            ("sum", torch.float32, (100003, 32), True),
+            ("sum", torch.float32, (2, 32768, 32), True),
+            ("sum", torch.float16, (32768, 64), True),
+            ("argmax", torch.float32, (65536, 32), True),
+            ("argmax", torch.float32, (100003, 32), True),
+            ("var_mean", torch.bfloat16, (2, 100003, 32), True),
+            ("sum", torch.float64, (32768, 32), True),
         ],
-        name_fn=lambda op, in_dtype, shape: (
-            f"{op}_{str(in_dtype)[6:]}_{len(shape)}d_{shape[-2]}"
+        name_fn=lambda op, dt, shape, split: "_".join(
+            [op, str(dt)[6:], f"{len(shape)}d", str(shape[-2])] + ["split"] * split
         ),
     )
-    def test_direct_plan_matches_the_indexed_tree(self, device, op, in_dtype, shape):
-        """Preserve each row's inner-tree DAG across plan shapes, fields, and ranks."""
+    def test_plan_matches_the_indexed_tree(self, device, op, in_dtype, shape, split):
+        """Preserve each row's inner-tree DAG across plans, fields, ranks, and partials."""
         x = torch.randn(shape, device=device).to(in_dtype)
         rows, columns = x.shape[-2:]
         batches = x.numel() // (rows * columns)
@@ -666,7 +673,8 @@ class TestOrderedColDevice(TestCase):
             "var_mean": (T.VarMeanOps(correction=0), [torch.float32] * 2),
         }[op]
         nouts = len(outputs)
-        got = ct.reduce_ordered_col(trait, f"ordered_{op}", x, outputs, nouts)
+        key = f"ordered_{op}_{in_dtype}_{shape}"
+        got = ct.reduce_ordered_col(trait, key, x, outputs, nouts, allow_split=split)
         reference = kg._try_indexed_itree(
             trait,
             f"ordered_{op}_reference",
@@ -682,11 +690,25 @@ class TestOrderedColDevice(TestCase):
         self.assertIsNotNone(reference)
         for a, b in zip(got, reference, strict=True):
             self.assertEqual(a.flatten().view(torch.uint8), b.view(torch.uint8))
+        ran = {k[0] for k in ct._CACHE if k[1] == key}
+        self.assertEqual(ran, {"ordered_col1" if split else "ordered_col"})
+
+    def test_split_plans_can_be_declined(self, device):
+        x = torch.randn(32768, 32, device=device)
+        trait = T.SumOps(acc=cutlass.Float32)
+        out = [torch.float32]
+        got = ct.reduce_ordered_col(trait, "decline", x, out, 1, allow_split=False)
+        self.assertIsNone(got)
+        # The same view runs as a split plan once allowed.
+        got = ct.reduce_ordered_col(trait, "decline", x, out, 1, allow_split=True)
+        self.assertIsNotNone(got)
+        self.assertIn("ordered_col1", {k[0] for k in ct._CACHE if k[1] == "decline"})
 
     @parametrize("pattern", ["negative_zero", "ties"])
-    def test_special_values_match_the_indexed_tree(self, device, pattern):
+    @parametrize("rows", [2048, 32768])
+    def test_special_values_match_the_indexed_tree(self, device, pattern, rows):
         """Keep signed-zero sums and argmax ties bitwise equal to the indexed tree."""
-        rows, columns = 2048, 32
+        columns = 32
         if pattern == "negative_zero":
             x = torch.full((rows, columns), -0.0, device=device)
             trait, outputs = T.SumOps(), [torch.float32]
@@ -694,7 +716,7 @@ class TestOrderedColDevice(TestCase):
             x = torch.ones(rows, columns, device=device)
             trait, outputs = T.ArgMaxOps(), [torch.int64]
         key = f"special_{pattern}"
-        got = ct.reduce_ordered_col(trait, key, x, outputs, 1)
+        got = ct.reduce_ordered_col(trait, key, x, outputs, 1, allow_split=True)
         reference = kg._try_indexed_itree(
             trait,
             key + "_reference",
