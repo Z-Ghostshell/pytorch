@@ -135,24 +135,36 @@ version and ``ROCBLAS_DEVICE_MEMORY_SIZE``), and at least the hipBLAS workspace 
 so a ``ROCBLAS_DEVICE_MEMORY_SIZE`` below that size has no effect.
 rocBLAS never grows a bound workspace: GEMMs that need more fall back to kernels that use less, and
 other calls that need more fail with ``rocblas_status_memory_error``. Handles are never destroyed.
-When a thread exits, its handles pass to other threads and streams, so the buffer stays allocated for
-the life of the process, and ``torch.cuda.empty_cache()`` does not release it. Where rocBLAS runs
-GEMMs through hipBLASLt, as on MI355X, each rocBLAS handle also holds about 25 MiB that hipBLASLt
-allocates when the handle is created, outside the caching allocator, and no API replaces it.
+When a thread exits, each of its handles passes only to a later thread using the same stream, and a
+handle for ``hipStreamPerThread`` passes to none, so the buffer stays allocated for the life of the
+process, and ``torch.cuda.empty_cache()`` does not release it. Where rocBLAS runs GEMMs through
+hipBLASLt, as on MI355X, each rocBLAS handle also holds about 25 MiB that hipBLASLt allocates when the
+handle is created, outside the caching allocator, and no API replaces it.
+
+ATen operations use rocBLAS handles of their own, which are also never destroyed: one for each
+thread and stream for eager operations, and one for each thread for captures, which a thread's first
+operation creates even if the thread never captures. Without workspaces bound, each holds about 1
+MiB, or about 27 MiB where rocBLAS runs GEMMs through hipBLASLt (measured on MI300X with ROCm 7.0
+and ``ROCBLAS_USE_HIPBLASLT=1``).
 
 A workspace bound with ``rocblas_set_workspace`` stays bound, even after the buffer is freed, and
-after the thread exits and the handle passes to another thread. Unbind it with
+after the thread exits and the handle passes to another thread using the same stream. Unbind it with
 ``rocblas_set_workspace(handle, nullptr, 0)`` before freeing the buffer. The handle then has no
 workspace, and ATen does not bind its own buffer again, so GEMMs on it use kernels that need none and
 other calls make rocBLAS allocate a workspace outside the caching allocator, which is not allowed
-during capture. A caller that needs its own workspace can create its own
-rocBLAS handle instead. Synchronize a handle's stream before its thread exits, and before moving the
-handle to another stream with ``rocblas_set_stream``, as rocBLAS requires.
+during capture. A caller that needs its own workspace can create its own rocBLAS handle instead.
 
-Call ``torch.cuda.current_blas_handle()`` on each thread before capture begins. It also creates ATen's
-handle for that thread; an ATen warmup operation alone does not create the handle the function
-returns. ``hipblasCreate`` initializes hipBLASLt, which allocates device memory that HIP rejects on a
-capturing stream.
+Outside capture, run work on a handle only on the stream it was returned for: calling
+``torch.cuda.current_blas_handle()`` on that stream again points the handle back at it without waiting
+for other streams, and when its thread exits, the handle passes to the next thread on that stream,
+whose work is ordered only after work queued there. To move a handle to another stream with
+``rocblas_set_stream``, synchronize its stream first, as rocBLAS requires, and synchronize the other
+stream before calling the function on the original stream again or letting the thread exit.
+
+Call ``torch.cuda.current_blas_handle()`` on each thread, on each stream it will use, before capture
+begins. It also creates ATen's own rocBLAS handles for that thread and stream; with caching disabled,
+an ATen warmup operation alone does not create the handle the function returns. ``hipblasCreate``
+initializes hipBLASLt, which allocates device memory that HIP rejects on a capturing stream.
 
 With caching disabled, while the current stream is capturing, ``torch.cuda.current_blas_handle()``
 returns a capture handle instead. There is one per thread, and it serves every stream in the capture:
@@ -170,7 +182,12 @@ capturing stream raises an error. Graph capture creates the capture stream's hip
 spare whenever the device supports hipBLASLt, in both workspace modes, so in a capture that forks two
 new side streams running hipBLASLt operations such as ``torch._scaled_mm``, the second raises. Run a
 hipBLASLt operation on each such stream before capture begins. TunableOp's tuning benchmarks must also
-run outside capture. See
+run outside capture. ATen's own rocBLAS handles for eager operations are likewise created for each
+thread and stream on first use, which allocates device memory and frees some, synchronizing the
+device. A capture in global mode, the default ``capture_error_mode``, forbids creating either kind of
+handle from every thread, because both allocate device memory. So before one begins, on each thread
+that will run eager operations while it is underway and each stream that thread will use, run a
+hipBLASLt operation, and call ``torch.cuda.current_blas_handle()`` or run a rocBLAS operation. See
 `ROCm/rocm-libraries#11838 <https://github.com/ROCm/rocm-libraries/issues/11838>`_.
 
 Extensions that call hipBLASLt themselves can use the workspace ``at::cuda::getCUDABlasLtWorkspace()``
@@ -182,7 +199,8 @@ When caching is enabled, a hipBLAS workspace is allocated for each combination o
 HIP stream that executes a hipBLAS kernel requiring a workspace.  In order to
 avoid repeatedly allocating workspaces, these workspaces are not deallocated unless
 ``torch._C._cuda_clearCublasWorkspaces()`` is called; note that it's the same function for CUDA or
-HIP. The workspace size per allocation can be specified via the environment variable
+HIP. Resetting a graph also frees every workspace cached for the stream it was captured on.
+The workspace size per allocation can be specified via the environment variable
 ``HIPBLAS_WORKSPACE_CONFIG`` with the format ``:[SIZE]:[COUNT]``.  As an example, the environment
 variable ``HIPBLAS_WORKSPACE_CONFIG=:4096:2:16:8`` specifies a total size of ``2 * 4096 + 8 * 16
 KiB`` or 8 MIB. The default workspace size is 32 MiB; MI300 and newer defaults to 128 MiB.
@@ -190,6 +208,15 @@ KiB`` or 8 MIB. The default workspace size is 32 MiB; MI300 and newer defaults t
 CUDA, other rocBLAS calls such as ``torch.dot`` then have rocBLAS allocate a workspace itself, outside
 the caching allocator, so they cannot be captured. For convenience, ``CUBLAS_WORKSPACE_CONFIG`` is also
 accepted.
+
+With caching enabled, ``torch.cuda.current_blas_handle()`` returns ATen's own handles: outside
+capture, the thread's handle for the current stream; while the current stream is capturing, the
+thread's own handle for the device, which serves every stream in the capture. That handle is not the
+capture handle described above: the thread's first rocBLAS operation creates it, graph capture
+creates neither it nor a spare, and it is not unbound when the capture ends. So a pointer mode set on
+the handle returned outside capture does not apply inside it. Its workspace for each stream is first
+allocated during capture, from the graph's memory pool; one for a stream other than the capture
+stream stays allocated, and keeps part of that pool in use, until the workspace cache is cleared.
 
 .. _hipfft-plan-cache:
 

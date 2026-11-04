@@ -1466,14 +1466,31 @@ def current_blas_handle():
     separate handles, and this function returns a different handle for each
     stream, because a rocBLAS workspace must not be shared by two streams at
     once. Each is bound when it is created to a buffer from a caching-allocator
-    pool reserved for these buffers, at least as large as the workspace rocBLAS would allocate, which
-    rocBLAS never grows. A workspace bound with
+    pool reserved for these buffers, at least as large as the workspace rocBLAS
+    would allocate, which rocBLAS never grows. A workspace bound with
     ``rocblas_set_workspace`` stays bound, even after the thread exits and the
-    handle passes to another thread, so unbind it before freeing the buffer.
-    While the current stream is capturing, ROCm returns a capture handle
-    instead, bound to a workspace from the capture's memory pool: call this
-    function inside the capture rather than reusing a handle obtained before
-    it, and do not use the capture handle after the capture ends.
+    handle passes to a later thread using the same stream, so unbind it before
+    freeing the buffer. A handle for ``hipStreamPerThread`` passes to no other
+    thread. While the current stream is capturing, ROCm returns a capture
+    handle instead, bound to a workspace from the capture's memory pool: call
+    this function inside the capture rather than reusing a handle obtained
+    before it, and do not use the capture handle after the capture ends. With
+    ``TORCH_CUBLAS_WORKSPACE_CACHE=1``, ROCm instead returns ATen's own
+    handles: one for each thread and stream outside capture, and inside a
+    capture the thread's handle for the device, which serves every stream in
+    the capture.
+
+    On ROCm outside capture, run work on the handle only on the stream it was
+    returned for: calling this function on that stream again points the handle
+    back at it without waiting for other streams, and when the thread exits,
+    the handle passes to the next thread on that stream, whose work is ordered
+    only after work queued there. A caller that moves the handle to another
+    stream with ``rocblas_set_stream`` must synchronize its stream first, as
+    rocBLAS requires, and synchronize the other stream before calling this
+    function on the original stream again or letting the thread exit. Called
+    on a thread and stream before a capture begins, this function also creates
+    ATen's rocBLAS handles for that thread and stream, but not its hipBLASLt
+    handle, which the first hipBLASLt operation there creates.
     """
     _lazy_init()
     return torch._C._cuda_getCurrentBlasHandle()
