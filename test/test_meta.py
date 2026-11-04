@@ -84,6 +84,8 @@ u32 = torch.uint32
 u64 = torch.uint64
 f8e4m3fn = torch.float8_e4m3fn
 
+inplace_op_db = [op for op in itertools.chain(op_db, foreach_op_db) if op.get_inplace()]
+
 class TestMetaConverter(TestCase):
     hw_classification = HardwareClassification.GENERIC
 
@@ -1328,11 +1330,9 @@ class TestMeta(_TestMetaBase):
         xfail('_foreach_norm'),
         xfail('_foreach_lerp', dtypes=integral_types_and(b8)),
     ))
-    @ops(itertools.chain(op_db, foreach_op_db))
+    @ops(inplace_op_db)
     def test_meta_inplace(self, device, dtype, op):
         func = op.get_inplace()
-        if not func:
-            self.skipTest("No inplace variable for this op")
         if op.promotes_int_to_float and not dtype.is_floating_point:
             self.skipTest("Op promotes to float, which is impossible for inplace with non-float input")
         if func in meta_inplace_skips:
@@ -1430,7 +1430,7 @@ class TestMeta(_TestMetaBase):
         xfail('_foreach_norm'),
         xfail('_foreach_lerp', dtypes=integral_types_and(b8)),
     ))
-    @ops(itertools.chain(op_db, foreach_op_db))
+    @ops(inplace_op_db)
     def test_dispatch_meta_inplace(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=False, inplace=True)
 
@@ -1519,7 +1519,7 @@ class TestMeta(_TestMetaBase):
         xfail('_foreach_norm'),
         xfail('_foreach_lerp', dtypes=integral_types_and(b8)),
     ))
-    @ops(itertools.chain(op_db, foreach_op_db))
+    @ops(inplace_op_db)
     def test_dispatch_symbolic_meta_inplace(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True)
 
@@ -1640,7 +1640,7 @@ class TestMetaCudaRef(_TestMetaBase):
         xfail('_foreach_norm'),
         xfail('_foreach_lerp', dtypes=integral_types_and(b8)),
     ))
-    @ops(itertools.chain(op_db, foreach_op_db), dtypes=OpDTypes.any_common_cpu_cuda_one)
+    @ops(inplace_op_db, dtypes=OpDTypes.any_common_cpu_cuda_one)
     # Only test on CUDA, as CUDA kernel's stride is the reference
     def test_dispatch_symbolic_meta_inplace_all_strides(self, device, dtype, op):
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True, all_stride_variants=True)

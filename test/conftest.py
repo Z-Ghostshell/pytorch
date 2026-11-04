@@ -5,7 +5,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import Counter, defaultdict
 from types import MethodType
 from typing import Any, TYPE_CHECKING, TypeGuard
 
@@ -29,6 +29,14 @@ except ImportError:
     # have this function.
     def parse_cmd_line_args():
         pass
+
+
+try:
+    # Absent when torch is not importable (the tools tests load this conftest)
+    # or when tests run against an older nightly; pruning is then simply off.
+    from torch.testing._internal.common_utils import skip_reason_at_collection
+except ImportError:
+    skip_reason_at_collection = None
 
 
 if TYPE_CHECKING:
@@ -186,6 +194,8 @@ def pytest_configure(config: Config) -> None:
             MultiGpuMinFilterPlugin(config.getoption("multigpu_min_gpus")),
             "multigpu_min_filter_plugin",
         )
+    if skip_reason_at_collection is not None and not _RERUN_DISABLED_TESTS:
+        config.pluginmanager.register(PruneSkipsPlugin(), "prune_skips_plugin")
 
 
 def pytest_unconfigure(config: Config) -> None:
@@ -485,6 +495,61 @@ class MultiGpuMinFilterPlugin:
         if count_file:
             with open(count_file, "a") as fp:
                 fp.write(f"{selected}\n")
+
+
+# Rerun-disabled mode runs only disabled tests, which the pruning hook never
+# decides on, and its own trylast hook below already drops everything else.
+_RERUN_DISABLED_TESTS = os.getenv("PYTORCH_TEST_RERUN_DISABLED_TESTS", "0") == "1"
+
+
+def _pytest_mark_skip_reason(item: Any) -> str | None:
+    try:
+        from _pytest.skipping import evaluate_skip_marks
+
+        skipped = evaluate_skip_marks(item)
+    except Exception:
+        return None
+    return skipped.reason if skipped else None
+
+
+class PruneSkipsPlugin:
+    """Deselect tests whose skip is decided before the body runs: pytest skip
+    marks, static unittest marks, decorators that recorded their condition
+    (common_utils.add_skip_condition), the slow-tests list and
+    PYTORCH_TEST_SKIP_FAST. They then cost nothing per test and never reach
+    TestCase.run, which under PYTORCH_TEST_WITH_DYNAMO wraps every test in
+    Dynamo. The decision is common_utils.skip_reason_at_collection, which
+    keeps anything it cannot decide. Always on; a run that needs skipped tests
+    reported, such as the junit and torchci report harnesses, opts out with
+    `-p no:prune_skips_plugin`. Runs trylast so -m, -k, sharding and the
+    other filters have already applied."""
+
+    def __init__(self) -> None:
+        self.reasons: Counter[str] = Counter()
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_collection_modifyitems(self, config: Config, items: list[Any]) -> None:
+        kept, pruned = [], []
+        for item in items:
+            cls, fn = getattr(item, "cls", None), getattr(item, "obj", None)
+            reason = _pytest_mark_skip_reason(item)
+            if reason is None:
+                reason = skip_reason_at_collection(cls, fn, item.name)
+            if reason is None:
+                kept.append(item)
+            else:
+                pruned.append(item)
+                self.reasons[reason] += 1
+        if pruned:
+            config.hook.pytest_deselected(items=pruned)
+            items[:] = kept
+
+    def pytest_report_collectionfinish(self, config: Config) -> str | None:
+        if not self.reasons:
+            return None
+        total = sum(self.reasons.values())
+        top = "; ".join(f"{n} x {r[:70]}" for r, n in self.reasons.most_common(3))
+        return f"Pruned {total} tests whose skip was decided at collection: {top}"
 
 
 class StepcurrentPlugin:
