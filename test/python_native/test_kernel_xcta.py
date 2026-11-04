@@ -3,6 +3,7 @@
 
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -120,6 +121,29 @@ class TestKernelXcta(TestCase):
                 torch.float32,
             )
         )
+
+    def test_b200_welford_subrow_target(self):
+        # Only single-row Welford at the 256 MiB and 2 GiB anchors shortens sub-rows.
+        default = kernel_xcta._XctaConfig().subrow_target
+        welford, plain = T.WelfordOps(correction=0), T.SumOps(acc=cutlass.Float32)
+        n = 128 << 20
+        cases = (
+            ((1, n), welford, "var0", 16384),
+            ((2, n), welford, "var0", default),
+            ((1, n - 2048), welford, "var0", default),
+            ((1, n), plain, "sum", default),
+        )
+        caps = SimpleNamespace(cc=(10, 0))
+        for shape, trait, key, want in cases:
+            x = torch.empty(shape, device="cuda", dtype=torch.float16)
+            with (
+                self.subTest(shape=shape, key=key),
+                mock.patch.object(kernel_xcta._hw, "caps", return_value=caps),
+                mock.patch.dict(kernel_xcta._GEOM, clear=True),
+            ):
+                kernel_xcta.reduce_row_xcta(trait, key, x, torch.float32)
+                # Geometry keys carry the sub-row target sixth.
+                self.assertEqual({k[5] for k in kernel_xcta._GEOM}, {want})
 
 
 if __name__ == "__main__":

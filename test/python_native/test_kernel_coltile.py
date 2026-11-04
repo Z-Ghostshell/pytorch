@@ -588,6 +588,12 @@ class TestOrderedColRoute(TestCase):
             (1, (128, 2047), False),
             (1, (128, 128, 31), False),
             (1, (128, 128, 32), True),
+            (1, (1, 32768, 128), True),
+            (1, (1, 32768, 127), False),
+            (1, (1, 24577, 128), True),
+            (1, (1, 24576, 128), False),
+            (1, (2, 32768, 128), False),
+            (2, (1, 32768, 16384), False),
         ],
         name_fn=lambda n, shape, routed: f"{n}f_" + "x".join(map(str, shape)),
     )
@@ -634,6 +640,13 @@ class TestOrderedColRoute(TestCase):
         narrow = ct._OrderedColReduce(trait, plan, 1024, (1 << 21) - 1, 1)
         wide = ct._OrderedColReduce(trait, plan, 1024, 1 << 21, 1)
         self.assertEqual((narrow.wide, wide.wide), (False, True))
+
+    @parametrize("columns", [512, 1024])
+    def test_general_norm_splits_need_wide_columns(self, columns):
+        view = torch.empty((1, 32768, columns), device="meta")
+        self.assertTrue(kg._ordered_col_route_ok(view, T.SumOps()))
+        routed = kg._ordered_col_route_ok(view, T.NormOps(3))
+        self.assertEqual(routed, columns >= 1024)
 
 
 class TestOrderedColHost(TestCase):
@@ -1068,6 +1081,17 @@ class TestOrderedColDevice(TestCase):
         # The last block's output index, B * C + WARP, must stay below the Int32 limit.
         with mock.patch.object(ct, "_INT32_LIMIT", 2 * 64 + 32):
             self.assertIsNone(ct.reduce_ordered_col(trait, "decline_int32", x, f32, 1))
+
+    def test_split_policy_matches_the_indexed_tree(self, device):
+        """Keep B200's split tile widths and input-dtype outputs bitwise exact."""
+        if torch.cuda.get_device_capability(device) != (10, 0):
+            self.skipTest("the split policy is measured on B200 only")
+        x = torch.randn(32768, 257, device=device, dtype=torch.float16)
+        key, trait, outputs = "split_policy", T.SumOps(), [torch.float16]
+        got, _ = self._reduce(device, trait, key, x, 0, outputs, route=True)
+        self.assertIn("ordered_col1", _tags(key))
+        want, _ = self._reduce(device, trait, key, x, 0, outputs, route=False)
+        self._assert_bitwise(got, want)
 
     @parametrize(
         "op,in_dtype,rows,columns,workers,width,offset,split",
