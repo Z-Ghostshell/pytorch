@@ -1,3 +1,4 @@
+import itertools
 import logging
 import threading
 from collections.abc import Callable, Sequence
@@ -23,6 +24,7 @@ from torch.distributed.tensor.placement_types import (
     Replicate,
     Shard,
 )
+from torch.types import IntLikeType
 
 
 logger = logging.getLogger(__name__)
@@ -143,7 +145,7 @@ def compute_local_shape_and_global_offset(
         consecutive rows and columns of the global tensor. A ``_StridedShard`` can
         leave a rank holding several separate chunks, and then ``global_offset`` is
         only where the first one starts. For such placements, use
-        :func:`compute_local_shape_and_global_offsets`.
+        :func:`compute_local_shape_and_chunks`.
 
     """
     empty_offset = ()
@@ -253,29 +255,6 @@ def _compute_local_shape_and_global_offset(
             raise AssertionError
         coordinate_lookup = my_coordinate
 
-    local_shape, shard_dim_to_global_offsets = _local_shape_and_global_offsets(
-        global_shape, mesh_shape, coordinate_lookup, placements, skip_offset
-    )
-    if skip_offset:
-        return tuple(local_shape), ()
-    global_offset = [0] * len(global_shape)
-    for shard_dim, global_offsets in shard_dim_to_global_offsets.items():
-        global_offset[shard_dim] = _get_first_offset(global_offsets)
-    return tuple(local_shape), tuple(global_offset)
-
-
-def _local_shape_and_global_offsets(
-    global_shape: ShapeType,
-    mesh_shape: ShapeType,
-    coordinate_lookup: Callable[[int], RankType],
-    placements: Sequence[Placement],
-    skip_offset: bool,
-) -> tuple[list[int], dict[int, torch.Tensor | None]]:
-    """
-    Shard ``global_shape`` by ``placements`` for one mesh coordinate. Returns the local
-    shape, and for each sharded tensor dim, the global index of each local position
-    along it (None if ``skip_offset``).
-    """
     local_shape = list(global_shape)
     # Perform shard from left to right. For example,
     #   global tensor: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -311,25 +290,52 @@ def _local_shape_and_global_offsets(
         )
         local_shape[shard_dim] = shard_size
         shard_dim_to_global_offsets[shard_dim] = shard_offsets
-    return local_shape, shard_dim_to_global_offsets
+    if skip_offset:
+        return tuple(local_shape), ()
+    global_offset = [0] * len(global_shape)
+    for shard_dim, global_offsets in shard_dim_to_global_offsets.items():
+        global_offset[shard_dim] = _get_first_offset(global_offsets)
+    return tuple(local_shape), tuple(global_offset)
 
 
-def compute_local_shape_and_global_offsets(
+def compute_local_shape_and_chunks(
     global_shape: ShapeType,
     mesh: DeviceMesh,
     placements: Sequence[Placement],
-) -> tuple[tuple[int, ...], list[torch.Tensor]]:
+) -> tuple[
+    tuple[IntLikeType, ...],
+    tuple[tuple[IntLikeType, ...], ...],
+    tuple[tuple[IntLikeType, ...], ...],
+    tuple[tuple[IntLikeType, ...], ...],
+]:
     """
     Compute the local tensor shape of a DTensor on its current global rank, and the
-    global index of every local position along each tensor dim.
+    chunks of the global tensor that the local tensor holds.
 
     :func:`compute_local_shape_and_global_offset` returns where the local tensor
     starts in the global tensor, which describes it only if it is one chunk of
     consecutive rows and columns. A ``_StridedShard`` can leave a rank holding
-    several separate chunks. ``global_offsets`` describes the local tensor either
-    way::
+    several separate chunks. The chunks describe the local tensor either way. Each is
+    a rectangle of consecutive indices along every dim, of the global tensor and of
+    the local tensor: chunk ``i`` starts at ``global_offsets[i]`` in the global
+    tensor and at ``local_offsets[i]`` in the local tensor, and has shape
+    ``local_sizes[i]``. This is the layout of the fields of
+    :class:`torch.distributed.checkpoint.protocol.CheckpointableTensor`::
 
-        local_tensor[i, j] == global_tensor[global_offsets[0][i], global_offsets[1][j]]
+        size = local_sizes[i]
+        local_index = tuple(slice(o, o + n) for o, n in zip(local_offsets[i], size))
+        global_index = tuple(slice(o, o + n) for o, n in zip(global_offsets[i], size))
+        assert torch.equal(local_tensor[local_index], global_tensor[global_index])
+
+    The number of chunks depends only on ``placements``: along each dim it is the
+    product of the ``split_factor`` of the ``_StridedShard`` placements on that dim,
+    and some chunks can be empty. Because it depends on neither the rank nor the
+    sizes, every rank in the mesh returns the same structure, and this can be traced
+    with a symbolic mesh coordinate, as under
+    ``torch.compiler.config.compile_on_one_rank``. An empty chunk can have the same
+    global offset as another chunk, so drop the chunks with a zero in
+    ``local_sizes`` before identifying chunks by global offset, as DCP does when it
+    looks up a ``CheckpointableTensor`` chunk.
 
     Example: a tensor of shape ``(8, 2)``, with its elements labelled ``a`` to ``p``,
     and placements ``[_StridedShard(0, split_factor=2), Replicate()]`` on a 2 x 2
@@ -349,11 +355,21 @@ def compute_local_shape_and_global_offsets(
         mesh dim 0   0   rank 0: rows 0, 1, 4, 5    rank 1: rows 0, 1, 4, 5
                      1   rank 2: rows 2, 3, 6, 7    rank 3: rows 2, 3, 6, 7
 
-    Rank 0 has local tensor ``[[a, b], [c, d], [i, j], [k, l]]``: rows 0, 1, 4, 5
-    and columns 0, 1 of the global tensor::
+    Rank 0 has local tensor ``[[a, b], [c, d], [i, j], [k, l]]``: global rows 0, 1
+    at local rows 0, 1, and global rows 4, 5 at local rows 2, 3::
 
-        local_shape      (4, 2)
-        global_offsets   [tensor([0, 1, 4, 5]), tensor([0, 1])]
+        local_shape = (4, 2)
+        global_offsets = ((0, 0), (4, 0))
+        local_offsets = ((0, 0), (2, 0))
+        local_sizes = ((2, 2), (2, 2))
+
+    With ``[_StridedShard(0, split_factor=2), Shard(0)]`` instead, rank 0 holds only
+    rows 0, 1, and its second chunk is empty::
+
+        local_shape = (2, 2)
+        global_offsets = ((0, 0), (4, 0))
+        local_offsets = ((0, 0), (2, 0))
+        local_sizes = ((2, 2), (0, 2))
 
     Args:
         global_shape (ShapeType): The global shape of the DTensor.
@@ -362,47 +378,131 @@ def compute_local_shape_and_global_offsets(
 
     Return:
         local_shape: the shape of the DTensor's _local_tensor on the current rank.
-        global_offsets: one 1-D int64 tensor per tensor dim, holding the global index
-        of each local position along that dim. Under ``LocalTensorMode`` these are
-        ``LocalTensor``s, whose lengths can differ between ranks. If the current
-        rank is not part of the mesh, ``local_shape`` is ``(0,)`` and this is empty.
+        global_offsets: for each chunk, where it starts in the global tensor.
+        local_offsets: for each chunk, where it starts in the local tensor.
+        local_sizes: for each chunk, its shape.
+        Under ``LocalTensorMode``, values that differ between ranks are ``SymInt`` s
+        holding each rank's value. If the current rank is not part of the mesh,
+        ``local_shape`` is ``(0,)`` and there are no chunks.
     """
-    coordinate = mesh.get_coordinate()
-    if coordinate is None:
-        return ((0,), [])
-    global_offsets = _compute_global_offsets(
+    if not mesh._is_current_rank_part_of_mesh():
+        return (0,), (), (), ()
+    coordinate = [
+        mesh._sym_get_coordinate(mesh_dim) if _is_shard_like(placement) else None
+        for mesh_dim, placement in enumerate(placements)
+    ]
+    return _compute_local_shape_and_chunks(
         global_shape, mesh.shape, coordinate, placements
     )
-    return tuple(offsets.shape[0] for offsets in global_offsets), global_offsets
+
+
+# accept 'plain data types' to enable simpler unit testing without creating device mesh
+def _compute_local_shape_and_chunks(
+    global_shape: ShapeType,
+    mesh_shape: ShapeType,
+    my_coordinate: Sequence[IntLikeType | None],
+    placements: Sequence[Placement],
+) -> tuple[
+    tuple[IntLikeType, ...],
+    tuple[tuple[IntLikeType, ...], ...],
+    tuple[tuple[IntLikeType, ...], ...],
+    tuple[tuple[IntLikeType, ...], ...],
+]:
+    """
+    :func:`compute_local_shape_and_chunks` for the mesh coordinate ``my_coordinate``.
+    """
+    ndim = len(global_shape)
+    values = _local_chunk_values(global_shape, mesh_shape, my_coordinate, placements)
+    local_shape, entries = tuple(values[:ndim]), values[ndim:]
+    num_chunks = len(entries) // (3 * ndim) if ndim else 1
+    chunks = [entries[3 * ndim * i : 3 * ndim * (i + 1)] for i in range(num_chunks)]
+    return (
+        local_shape,
+        tuple(tuple(chunk[0::3]) for chunk in chunks),
+        tuple(tuple(chunk[1::3]) for chunk in chunks),
+        tuple(tuple(chunk[2::3]) for chunk in chunks),
+    )
 
 
 @maybe_run_for_local_tensor
-def _compute_global_offsets(
+def _local_chunk_values(
     global_shape: ShapeType,
     mesh_shape: ShapeType,
-    my_coordinate: Sequence[int],
+    my_coordinate: Sequence[IntLikeType | None],
     placements: Sequence[Placement],
-) -> list[torch.Tensor]:
+) -> tuple[IntLikeType, ...]:
     """
-    The ``global_offsets`` of :func:`compute_local_shape_and_global_offsets` for the
-    mesh coordinate ``my_coordinate``. Under ``LocalTensorMode`` this runs once per
-    rank, because the number of indices can differ between ranks.
+    The local shape, then each chunk's global offset, local offset and size along
+    each dim, as one flat tuple. Under ``LocalTensorMode`` this runs once per rank,
+    and the ranks' results are combined element by element, so it returns a flat
+    tuple of the same length on every rank.
     """
-    local_shape, shard_dim_to_global_offsets = _local_shape_and_global_offsets(
-        global_shape,
-        mesh_shape,
-        lambda mesh_dim: my_coordinate[mesh_dim],
-        placements,
-        skip_offset=False,
+    # For each dim, the runs of consecutive global indices the local tensor holds,
+    # in local order, as (global start, length). Sharding is applied left to right.
+    runs: list[list[tuple[IntLikeType, IntLikeType]]] = [
+        [(0, size)] for size in global_shape
+    ]
+    for mesh_dim, placement in enumerate(placements):
+        if not _is_shard_like(placement):
+            continue
+        dim = placement.dim
+        if dim >= len(global_shape):
+            raise AssertionError(
+                f"Sharding dim {dim} greater than tensor ndim {len(global_shape)}"
+            )
+        rank = my_coordinate[mesh_dim]
+        if rank is None:
+            raise AssertionError(f"No mesh coordinate for shard mesh dim {mesh_dim}")
+        runs[dim] = _shard_runs(runs[dim], mesh_shape[mesh_dim], rank, placement)
+
+    # A chunk is one run along each dim.
+    local_starts = [
+        list(itertools.accumulate((length for _, length in r), initial=0))[:-1]
+        for r in runs
+    ]
+    values: list[IntLikeType] = [sum(length for _, length in r) for r in runs]
+    for chunk in itertools.product(*(zip(r, s) for r, s in zip(runs, local_starts))):
+        for (global_start, length), local_start in chunk:
+            values += (global_start, local_start, length)
+    return tuple(values)
+
+
+def _shard_runs(
+    runs: list[tuple[IntLikeType, IntLikeType]],
+    mesh_dim_size: int,
+    rank: IntLikeType,
+    placement: Shard | _StridedShard,
+) -> list[tuple[IntLikeType, IntLikeType]]:
+    """
+    The runs of global indices left on ``rank`` when ``placement`` shards a dim whose
+    local tensor holds ``runs``. A ``Shard`` keeps one range of the local tensor; a
+    ``_StridedShard`` keeps one from each of its ``split_factor`` groups, as
+    ``_StridedShard.local_shard_size_and_offset`` does. Each range keeps its part of
+    every run, possibly empty, so the number of runs depends only on the placements,
+    and nothing here branches on ``rank``.
+    """
+    size = sum(length for _, length in runs)
+    split_factor = (
+        placement._split_factor_int() if isinstance(placement, _StridedShard) else 1
     )
-    global_offsets = []
-    for dim, size in enumerate(global_shape):
-        offsets = shard_dim_to_global_offsets.get(dim)
-        if offsets is None:
-            offsets = torch.arange(size)
-        # A rank holding nothing along a dim gets a one-index placeholder.
-        global_offsets.append(offsets[: local_shape[dim]])
-    return global_offsets
+    selected: list[tuple[IntLikeType, IntLikeType]] = []
+    for group in range(split_factor):
+        group_size, group_start = Shard.local_shard_size_and_offset(
+            size, split_factor, group
+        )
+        piece_size, piece_start = Shard.local_shard_size_and_offset(
+            group_size, mesh_dim_size, rank
+        )
+        start = group_start + piece_start
+        position: IntLikeType = 0
+        for global_start, length in runs:
+            first = torch.sym_min(torch.sym_max(start - position, 0), length)
+            last = torch.sym_min(
+                torch.sym_max(start + piece_size - position, 0), length
+            )
+            selected.append((global_start + first, last - first))
+            position = position + length
+    return selected
 
 
 compute_global_tensor_info = torch._C._DTensor_compute_global_tensor_info
