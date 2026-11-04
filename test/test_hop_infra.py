@@ -527,10 +527,12 @@ class TestCuteDSLHOPHelpers(TestCase):
             (Cfg(2.0, weight=t), r" at \.weight"),
             (with_extra, r" at \.extra"),
             (types.SimpleNamespace(w=t), r" at \.w"),
-            (t, ""),
         ):
             with self.assertRaisesRegex(TypeError, msg.format(where)):
                 table.add_constant_args({"cfg": value})
+        msg = "^a constant kernel argument is a tensor: pass each tensor as its own "
+        with self.assertRaisesRegex(TypeError, msg + "argument$"):
+            table.add_constant_args({"cfg": t})
 
     def test_host_fn_info_checks_and_splits_a_call(self):
         # check_call and split_args need only a parsed signature, written out here: a
