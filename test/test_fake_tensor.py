@@ -45,6 +45,7 @@ from torch._subclasses.fake_tensor import (
     is_fake_tensor,
     maybe_get_fake_constant,
     maybe_get_fake_device,
+    maybe_get_fake_dispatch_keys,
     maybe_get_fake_mode,
     maybe_get_real_tensor,
     MetadataMismatchError,
@@ -5722,6 +5723,29 @@ class TestCppFakeTensorModeBindings(TestCase):
         torch._C._set_fake_item_memo(fake, 2, None)
         fake.data = make_fake()
         self.assertIsNone(torch._C._get_fake_item_memo(fake, 4))
+
+    def test_fake_dispatch_keys(self):
+        mode, _ = self._make_mode()
+        meta = torch.empty(2, device="meta")
+        meta_fake = torch._C._from_meta_and_device(meta, torch.device("meta"), mode)
+        self.assertIsNone(maybe_get_fake_dispatch_keys(meta_fake))
+        keys = torch._C._dispatch_keys(torch.empty(2))
+        torch._C._set_fake_dispatch_keys(meta_fake, keys)
+        recorded = maybe_get_fake_dispatch_keys(meta_fake)
+        self.assertEqual(recorded.raw_repr(), keys.raw_repr())
+        # detach and alias keep them, like a Python FakeTensor's. Excluding
+        # Fake runs their own kernels.
+        fake_key = torch._C.DispatchKeySet(torch._C.DispatchKey.Fake)
+        with torch._C._ExcludeDispatchKeyGuard(fake_key):
+            outs = [meta_fake.detach(), torch.ops.aten.alias(meta_fake)]
+        for out in outs:
+            recorded = maybe_get_fake_dispatch_keys(out)
+            self.assertEqual(recorded.raw_repr(), keys.raw_repr())
+        # A new fake made from it does not, like Python's from_meta_and_device
+        fake = torch._C._from_meta_and_device(meta_fake, torch.device("cpu"), mode)
+        self.assertIsNone(maybe_get_fake_dispatch_keys(fake))
+        torch._C._set_fake_dispatch_keys(meta_fake, None)
+        self.assertIsNone(maybe_get_fake_dispatch_keys(meta_fake))
 
 
 if __name__ == "__main__":
