@@ -27,7 +27,7 @@ from .kernel_general import (
     ReduceBlock,
 )
 from .kernel_rowtile import trait_itree_plan
-from .traits import WARP
+from .traits import WARP, welford_nouts
 
 
 _compile = _L.compile_kernel
@@ -88,7 +88,11 @@ def select_ordered_col_config(
     field_bits: tuple[int, ...],
     out_dtypes: tuple[torch.dtype, ...],
 ) -> OrderedColConfig | None:
-    cfg = _ORDERED_COL_CONFIGS.get(cc, {}).get(trait_key)
+    configs = _ORDERED_COL_CONFIGS.get(cc, {})
+    welford = welford_nouts(trait_key)
+    cfg = configs.get(trait_key)
+    if cfg is None and welford:
+        cfg = configs.get("varmean0" if welford == 2 else "var0")
     if (
         cfg is None
         or dtype not in (torch.float32, torch.bfloat16)
@@ -97,9 +101,7 @@ def select_ordered_col_config(
         or partials < 1
     ):
         return None
-    fields = (
-        3 if trait_key in ("var0", "varmean0") else 2 if trait_key == "argmaxi32" else 1
-    )
+    fields = 3 if welford else 2 if trait_key == "argmaxi32" else 1
     output = (
         dtype
         if trait_key == "amax" or fields == 3
@@ -107,7 +109,7 @@ def select_ordered_col_config(
         if fields == 2
         else torch.float32
     )
-    nouts = 2 if trait_key == "varmean0" else 1
+    nouts = max(welford, 1)
     if field_bits != (32,) * fields or out_dtypes != (output,) * nouts:
         return None
     if partials * columns < WARP * cfg.min_blocks:
@@ -133,6 +135,7 @@ class ColConfig(NamedTuple):
     partial_layout: str
     combine_columns: int = 0
     unroll: int = tile._ROLL_UNROLL
+    group: int = 1
 
 
 def select_col_config(
@@ -883,6 +886,7 @@ def _reduce_col_tile(
         batched_col=x.dim() == 3,
         pc=pc,
         unroll=cfg.unroll,
+        col_group=cfg.group,
     )
     parts = (
         []
