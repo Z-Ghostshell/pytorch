@@ -16,6 +16,7 @@ from torch._tensor_iterator import reduce_op
 from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import torch2cute
 from ...cutedsl.plan_cache import cached_plan
+from ...utils.device import check_current
 from . import tile
 from .traits import WARP
 
@@ -179,7 +180,9 @@ def _launch(
 ) -> None:
     # _PLAN caches boxed geometry (~6us); _COMPILE_CACHE deduplicates structural kernels.
     op_name = key[1]
-    key = (str(ins[0].device),) + key
+    device = ins[0].get_device()
+    check_current(device)
+    key = (device,) + key
     plan = _PLAN.get((key, op.geom_sig))
     if plan is None:
         fn = cached_plan(
@@ -190,14 +193,14 @@ def _launch(
                 _fakes(ins, int64_extent=True),
                 _fakes(outs, int64_extent=op.wide_output),
                 *_geom_args(op),
-                _stream(),
+                _stream(device),
             ),
             op=f"aten::{op_name}",
         )
         plan = (fn, _geom_args(op))
         _PLAN[(key, op.geom_sig)] = plan
     fn, geom = plan
-    fn(_operands(ins, read_only=True), _operands(outs), *geom, _stream())
+    fn(_operands(ins, read_only=True), _operands(outs), *geom, _stream(device))
 
 
 def _ti_pairs(x: torch.Tensor, out: torch.Tensor) -> tuple[Pairs, Pairs]:

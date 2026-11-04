@@ -11,6 +11,7 @@ import torch
 from ...cutedsl import launch as _L
 from ...cutedsl.dtypes import torch2cute
 from ...cutedsl.plan_cache import cached_plan
+from ...utils.device import check_current
 from . import tile
 from .kernel_general import _launch, _PART_TORCH, ReduceBlock
 
@@ -52,6 +53,8 @@ def reduce_col_tile(
     """Reduce dim 0 of contiguous 2D x to (C,), splitting it npar ways."""
     if x.dim() != 2 or not x.is_cuda or x.stride(-1) != 1:
         raise AssertionError(f"want 2D contiguous-last-dim CUDA, got {tuple(x.shape)}")
+    device = x.get_device()
+    check_current(device)
     if threads_per_block is None:
         threads_per_block = (
             _WIDE_ACC_THREADS_PER_BLOCK if trait.nfields >= 3 else _THREADS_PER_BLOCK
@@ -116,7 +119,7 @@ def reduce_col_tile(
             None,
             None,
             None,
-            _stream(),
+            _stream(device),
         )
 
     # _VEC_MAX decouples vec from compile-time alignment, so key both.
@@ -126,7 +129,7 @@ def reduce_col_tile(
         x.dtype,
         out_dtype,
         align,
-        str(x.device),
+        device,
     ) + op.cache_sig
     build = lambda: _compile(op, *_fake())  # noqa: E731
     cached_plan(_CACHE, key, build, op=f"aten::{trait_key}")(
@@ -143,7 +146,7 @@ def reduce_col_tile(
         None,
         None,
         None,
-        _stream(),
+        _stream(device),
     )
     if single:
         return out
@@ -194,7 +197,7 @@ def reduce_col_tile(
             None,
             None,
             None,
-            _stream(),
+            _stream(device),
         )
 
     pdt = tuple(pp.dtype for pp in parts)
@@ -204,7 +207,7 @@ def reduce_col_tile(
         x.dtype,
         out_dtype,
         pdt,
-        str(x.device),
+        device,
     ) + op2.cache_sig
     build2 = lambda: _compile(op2, *_fake2())  # noqa: E731
     cached_plan(_CACHE, key2, build2, op=f"aten::{trait_key}")(
@@ -221,6 +224,6 @@ def reduce_col_tile(
         None,
         None,
         None,
-        _stream(),
+        _stream(device),
     )
     return out
