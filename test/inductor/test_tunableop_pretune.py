@@ -126,6 +126,9 @@ def _ladder(sym, hint=512, declared=(2, 2**31 - 1), ladder=True):
     submitted = []
 
     def _record(job, timeout=None):
+        # The job itself, not just its request: what the ladder asks the
+        # worker for is as much a contract as the shapes it rebuilds.
+        job.bmreq.job = job
         submitted.append(job.bmreq)
         return mock.Mock(status="ok", time=1.0)
 
@@ -152,8 +155,13 @@ def _ladder(sym, hint=512, declared=(2, 2**31 - 1), ladder=True):
 
 
 class _Job:
-    def __init__(self, bmreq, tuning=False, **kwargs):
+    def __init__(self, bmreq, tuning=False, measure=True, **kwargs):
         self.bmreq = bmreq
+        # Kept rather than swallowed by **kwargs: the ladder asks for
+        # measure=False, and a stub that drops it cannot notice when that
+        # stops happening.
+        self.tuning = tuning
+        self.measure = measure
 
 
 def _run(winner, **kwargs):
@@ -182,14 +190,15 @@ class TestTunableOpPretune(TestCase):
         """A GEMM whose M is the dynamic dim.
 
         Operand lists match what each op is really lowered with: bias-first for
-        addmm/baddbmm, and [mat_a, mat_b, scale_a, scale_b] for _scaled_mm --
+        addmm/addmm_dtype/baddbmm, the same set maybe_range_pretune reads
+        nodes[1:3] for, and [mat_a, mat_b, scale_a, scale_b] for _scaled_mm --
         where scale_a carries the symbol too, so it goes through the meta
         rebuild and the density check like the matrices do.
         """
         m, k, n = s, 256, 512
         mat1 = _buffer("mat1", [m, k], [k, 1])
         mat2 = _buffer("mat2", [k, n], [n, 1])
-        if name in ("addmm", "baddbmm"):
+        if name in ("addmm", "addmm_dtype", "baddbmm"):
             bias = _buffer("bias", [m, n], [n, 1])
             return _FakeWinner(name, [bias, mat1, mat2], [m, n])
         if name.startswith("_scaled_mm"):
@@ -209,6 +218,16 @@ class TestTunableOpPretune(TestCase):
             self.assertEqual(len(metas), 4, "scales must reach the worker")
             # scale_a carries the symbol, so it is rebuilt with the matrices
             self.assertEqual(metas[2].sizes[0], metas[0].sizes[0])
+
+    def test_ladder_jobs_are_tune_only(self):
+        """measure=False is what halves the worker cost per rung: the caller
+        discards the time, so the second benchmark would be pure waste."""
+        s = sympy.Symbol("s_measure", positive=True, integer=True)
+        submitted = _run(self._mm_winner("mm", s), sym=s)
+        self.assertTrue(submitted)
+        for bmreq in submitted:
+            self.assertTrue(bmreq.job.tuning)
+            self.assertFalse(bmreq.job.measure)
 
     def test_unsupported_op_is_skipped(self):
         s = sympy.Symbol("s_other", positive=True, integer=True)
@@ -914,6 +933,86 @@ class TestTunableOpPretune(TestCase):
             sched._has_layout_conflict_for_template.assert_not_called()
         winner.output_node.assert_called_once()
 
+    def _gemm_gm(self, device):
+        """A one-node graph whose mm carries a device, as lowering would."""
+        g = torch.fx.Graph()
+        node = g.call_function(
+            torch.ops.aten.mm.default, (g.placeholder("a"), g.placeholder("b"))
+        )
+        node.meta["val"] = mock.Mock(device=torch.device(device))
+        g.output(node)
+        return torch.fx.GraphModule(torch.nn.Module(), g)
+
+    @parametrize(
+        "mode,device,expect_bypass",
+        (
+            ("off", "cuda", False),
+            ("tune", "cuda", True),
+            ("reuse", "cuda", True),
+            ("tune", "cpu", False),
+        ),
+    )
+    def test_enabled_modes_bypass_the_fx_graph_cache(self, mode, device, expect_bypass):
+        # Both passes work while lowering -- tune records, reuse borrows and
+        # validates -- so a cache hit does neither and a rerun writes an empty
+        # results file. AOTAutogradCache routes through the same validator.
+        # Only for graphs that would do that work: bypassing a CPU or
+        # GEMM-free graph recompiles it every time for nothing.
+        from torch._inductor.codecache import BypassFxGraphCache, FxGraphCache
+
+        gm = self._gemm_gm(device)
+        with mock.patch("torch.cuda.is_available", return_value=True):
+            with config.patch({"cuda.autotune_tunableop_mode": mode}):
+                try:
+                    FxGraphCache._check_can_cache(gm, require_shape_env=False)
+                except BypassFxGraphCache as e:
+                    bypassed = "TunableOp" in str(e)
+                else:
+                    bypassed = False
+        self.assertEqual(bypassed, expect_bypass)
+
+    @parametrize("tunableop_on", (True, False))
+    def test_pipelined_autotuning_is_off_when_enabled(self, tunableop_on):
+        # The pipelined path benchmarks the bmreq directly, so the routing in
+        # ExternKernelCaller.benchmark never runs and nothing is tuned.
+        from torch._inductor.autotune_process import use_pipelined_autotuning
+
+        with config.patch({"pipeline_max_autotune_gemm": True}):
+            with mock.patch(
+                "torch._inductor.tunableop.is_enabled", return_value=tunableop_on
+            ):
+                self.assertEqual(use_pipelined_autotuning(), not tunableop_on)
+
+    @parametrize("device", ("cuda", "cpu"))
+    def test_autotune_local_cache_is_bypassed_for_routed_gemms(self, device):
+        # A cached timing skips benchmark(), so neither tuning nor borrow
+        # validation runs. The write side matters as much: update_local_cache
+        # rewrites the whole file from the dict given, so a bypass that still
+        # called it would replace the machine's cache. A CPU GEMM is timed
+        # inline, never routed, and must keep its cache.
+        from torch._inductor.codecache import PersistentCache
+
+        s = sympy.Symbol(f"s_cache_{device}", positive=True, integer=True)
+        winner = self._mm_winner("mm", s)
+        winner.hash_key = lambda: "fake-choice"
+        winner.layout = ir.FixedLayout(
+            torch.device(device), DTYPE, [s, 512], _contiguous_strides([s, 512])
+        )
+        routed = device == "cuda"
+        with (
+            mock.patch.object(
+                PersistentCache, "get_local_cache", return_value={}
+            ) as read_cache,
+            mock.patch.object(PersistentCache, "update_local_cache") as write_cache,
+            mock.patch("torch._inductor.tunableop.is_enabled", return_value=True),
+        ):
+            timings = PersistentCache().lookup(
+                [winner], "mm", "inputs", lambda cs: {c: 1.0 for c in cs}
+            )
+        self.assertEqual(timings, {winner: 1.0})
+        self.assertEqual(read_cache.called, not routed)
+        self.assertEqual(write_cache.called, not routed)
+
 
 class TunableOpPretuneRealGpuTest(InductorTestCase):
     """The ladder against a real compile, worker and results file.
@@ -924,7 +1023,8 @@ class TunableOpPretuneRealGpuTest(InductorTestCase):
 
     InductorTestCase enters fresh_cache(), which isolates the cache directory
     per test and clears _pretuned_gemms with it, so the compile always starts
-    cold.
+    cold and this does not exercise the cache bypass;
+    test_enabled_modes_bypass_the_fx_graph_cache covers that directly.
     """
 
     hw_classification = HardwareClassification.CUDA

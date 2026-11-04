@@ -52,6 +52,12 @@ class TunableOp {
       ResultEntry result = ResultEntry::Null();
       TuningContext* ctx = getTuningContext();
 
+      // TUNABLE_LOG evaluates its arguments before checking the level, so the
+      // failure log below reuses these rather than recomputing them. Empty
+      // while TunableOp is disabled: there is no resolved solution to name.
+      std::string op_sig;
+      std::string concrete_sig;
+
       // Callers already gate on this; skipping the resolve here avoids
       // params->Signature() and manager init for any caller that does not.
       if (!ctx->IsTunableOpEnabled()) {
@@ -59,8 +65,8 @@ class TunableOp {
       }
       else {
         auto& mgr = ctx->GetTuningResultsManager();
-        const auto op_sig = Signature();
-        const auto concrete_sig = params->Signature();
+        op_sig = Signature();
+        concrete_sig = params->Signature();
         const bool has_dynamic_dim = params->dynamic_dims_mask.any();
 
         result = mgr.Lookup(op_sig, concrete_sig);
@@ -115,7 +121,17 @@ class TunableOp {
         op = GetOp(result.GetKey());
       }
       TORCH_CHECK(op != nullptr);
-      return op->Call(params);
+      const auto status = op->Call(params);
+      if (status != OK && !op_sig.empty()) {
+        // No retry on Default: every caller already treats a non-OK status as
+        // "use my own non-tunable path", so retrying here would duplicate the
+        // fallback and hide which candidate failed. Level 2 like the other
+        // per-call messages above -- a solution that keeps failing would
+        // otherwise log on every GEMM at verbosity 1.
+        TUNABLE_LOG2("solution ", result, " failed for ", op_sig, "(",
+            concrete_sig, "), returning non-OK for caller fallback");
+      }
+      return status;
     }
 
     virtual std::string Signature() {
@@ -200,7 +216,12 @@ class TunableOp {
       TuningContext* ctx = getTuningContext();
 
       auto borrowed = ResultEntry::Null();
-      if (ctx->IsNearestMatchEnabled()) {
+      // Skipped once this shape is known to have nothing to borrow: the scan
+      // below copies the op's map and parses every signature, and nothing
+      // records the miss, so otherwise every call of this shape repeats it.
+      const bool may_borrow = ctx->IsNearestMatchEnabled() &&
+          !mgr.BorrowUnavailable(op_sig, concrete_sig);
+      if (may_borrow) {
         borrowed = mgr.LookupNearest(op_sig, concrete_sig);
         if (borrowed != ResultEntry::Null() && !DonorIsUsable(borrowed, params)) {
           borrowed = ResultEntry::Null();
@@ -219,6 +240,9 @@ class TunableOp {
         }
       }
       const bool will_validate = (borrowed != ResultEntry::Null());
+      if (may_borrow && !will_validate) {
+        mgr.MarkBorrowUnavailable(op_sig, concrete_sig);
+      }
 
       // Only a validated donor persists this shape, leaving offline tuning
       // nothing to find. Report unless a persisted verdict is coming; the
@@ -282,6 +306,10 @@ class TunableOp {
           TUNABLE_LOG2(
               "borrow validation failed for ", op_sig, '(', concrete_sig,
               "), recording untuned: ", e.what());
+          // The donor is registered but will not run this shape, which no
+          // later call changes: without this the throw repeats, and with it
+          // the allocation it threw out of leaks only once per signature.
+          mgr.MarkBorrowUnavailable(op_sig, concrete_sig);
           if (ctx->IsRecordUntunedEnabled()) {
             mgr.RecordUntuned(
                 ctx->GetUntunedFile(), op_sig, concrete_sig,
@@ -294,7 +322,9 @@ class TunableOp {
       }
       // Nearest match takes precedence: once it is on, a miss with no usable
       // donor of either kind (nearest or wildcard) is a miss rather than a
-      // reason to return an unvalidated wildcard hint.
+      // reason to return an unvalidated wildcard hint. Memoized or not -- the
+      // memo records that there was nothing to borrow, which is the same
+      // answer the scan gave.
       if (ctx->IsNearestMatchEnabled()) {
         return ResultEntry::Default();
       }

@@ -303,6 +303,8 @@ void TuningResultsManager::AddAndMaybePersist(const std::string& op_signature,
   // ---- mutate maps under results lock ----
   {
     std::scoped_lock l{lock_};
+    // A new entry can be the donor a memoized failure was told did not exist.
+    borrow_unavailable_.clear();
     auto& km = results_[op_signature];  // creates if missing
     is_new = (!km.contains(params_signature));
     AddImpl(op_signature, params_signature, std::move(best), km);
@@ -380,6 +382,27 @@ void TuningResultsManager::RecordBorrowed(const std::string& op_signature,
   AddAndMaybePersist(op_signature, params_signature, std::move(entry), /*force_persist=*/true);
 }
 
+namespace {
+std::string BorrowKey(const std::string& op_signature,
+    const std::string& params_signature) {
+  // '\0' rather than a printable separator: a signature can contain anything
+  // the backend emits, and two different pairs must not collide.
+  return op_signature + '\0' + params_signature;
+}
+}  // namespace
+
+void TuningResultsManager::MarkBorrowUnavailable(const std::string& op_signature,
+    const std::string& params_signature) {
+  std::scoped_lock l{lock_};
+  borrow_unavailable_.insert(BorrowKey(op_signature, params_signature));
+}
+
+bool TuningResultsManager::BorrowUnavailable(const std::string& op_signature,
+    const std::string& params_signature) {
+  std::scoped_lock l{lock_};
+  return borrow_unavailable_.count(BorrowKey(op_signature, params_signature)) != 0;
+}
+
 void TuningResultsManager::ClearUntuned() {
   std::scoped_lock l{lock_};
   untuned_results_.clear();
@@ -389,6 +412,7 @@ void TuningResultsManager::ClearAll() {
   std::scoped_lock l{lock_};
   results_.clear();
   untuned_results_.clear();
+  borrow_unavailable_.clear();
 }
 
 void TuningResultsManager::InitRealtimeAppend(const std::string& filename, const std::unordered_map<std::string, std::string>& validators) {

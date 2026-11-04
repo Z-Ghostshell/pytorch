@@ -3874,10 +3874,21 @@ class ExternKernelCaller(ChoiceCaller):
         # grouped/sparse GEMMs, custom-op fallbacks -- would tune GEMMs they
         # call internally into the results file, and their bmreqs build inputs
         # (rand_strided, zero-filled integer tensors) that mis-time them.
+        # The remaining gates are all about not spending the worker on a
+        # candidate it cannot benchmark. routing_is_open(): a worker that has
+        # just died three times running is containing nothing, and each fault
+        # costs a kill and a cold restart. output_tensor_meta: __init__ leaves
+        # the metas [] when TensorMeta.from_irnodes raises, which fails the
+        # worker's own assertion for an arg-less benchmark -- a guaranteed
+        # kill where inline would have worked. VERIFY: the routed path never
+        # writes `out`, so the caller's expected would be an unwritten buffer.
         if (
             tunableop.is_enabled()
             and out.is_cuda
             and tunableop.is_tunableop_gemm(self.choice.name)
+            and tunableop.routing_is_open()
+            and isinstance(self.bmreq.output_tensor_meta, TensorMeta)
+            and not VERIFY
         ):
             # Extern kernels are otherwise benchmarked inline, assuming they do not
             # crash (see benchmark_in_sub_process); hipBLASLt tuning can abort the
@@ -3896,6 +3907,7 @@ class ExternKernelCaller(ChoiceCaller):
                     dyn_dims_mask=self.tunable_dyn_dims_mask,
                 )
             )
+            tunableop.note_routing_outcome(outcome.status)
             if outcome.status == "ok":
                 return outcome.time
             # Time the untuned kernel inline rather than dropping the candidate.
@@ -3909,7 +3921,10 @@ class ExternKernelCaller(ChoiceCaller):
             tunable = torch.cuda.tunable
             was_enabled = tunable.is_enabled()
             was_tuning = tunable.tuning_is_enabled()
-            log.warning(
+            # Debug, not warning: submit() has already reported the fault
+            # itself, once per kind. This fires per candidate and only says
+            # what was done about it.
+            log.debug(
                 "TunableOp benchmark of %s hit %s; timing it inline instead.",
                 self.name,
                 outcome.status,
